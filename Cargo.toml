@@ -14,3 +14,6 @@ tokio = { version = "1", features = ["rt", "net", "macros", "signal", "sync", "t
 lto = true
 codegen-units = 1
 strip = true
+
+[target."cfg(unix)".dev-dependencies]
+nix = { version = "0.31", features = ["signal"] }

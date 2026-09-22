@@ -9,6 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// The proxy's own Huffman codec, compiled into the test to build the
+/// compressed `connect` a Q3 client sends.
+#[path = "../src/huff.rs"]
+#[allow(dead_code)]
+mod huff;
+
 const OOB: &[u8] = b"\xff\xff\xff\xff";
 const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -38,7 +44,17 @@ struct FakeServer {
 }
 
 impl FakeServer {
+    /// A QuakeWorld server.
     fn start() -> Self {
+        Self::start_with(false)
+    }
+
+    /// A Quake III server: text challenge, `connectResponse` on connect.
+    fn start_q3() -> Self {
+        Self::start_with(true)
+    }
+
+    fn start_with(q3: bool) -> Self {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -60,11 +76,19 @@ impl FakeServer {
 
                     let reply: Vec<u8> = if data == [OOB, b"getchallenge\n"].concat() {
                         [OOB, b"c777\0"].concat()
+                    } else if data == [OOB, b"getchallenge"].concat() {
+                        [OOB, b"challengeResponse 777"].concat()
                     } else if data.starts_with(&[OOB, b"connect "].concat()) {
-                        [OOB, b"j"].concat()
+                        if q3 {
+                            [OOB, b"connectResponse"].concat()
+                        } else {
+                            [OOB, b"j"].concat()
+                        }
                     } else if data.starts_with(&[OOB, b"rcon"].concat()) {
                         [OOB, b"nrcon ok\n"].concat()
-                    } else if !data.starts_with(OOB) {
+                    } else if !data.starts_with(OOB) && data.len() > 10 {
+                        // Game traffic is echoed back; a bare keepalive (netchan
+                        // header only) gets no reply, as from a real server.
                         [&[1, 0, 0, 0, 1, 0, 0, 0][..], b"echo:", &data[10..]].concat()
                     } else {
                         continue;
@@ -227,6 +251,28 @@ fn game_packet(payload: &[u8]) -> Vec<u8> {
     [&[5, 0, 0, 0, 6, 0, 0, 0, 5, 0][..], payload].concat()
 }
 
+/// Completes the QW handshake so game packets flow through to `server`.
+/// `userinfo_extra` is appended to the userinfo, e.g. `\\spectator\\1`.
+fn connect_client(proxy: &Proxy, server: &FakeServer, userinfo_extra: &[u8]) -> Client {
+    let client = Client::connect(proxy.addr);
+    let challenge = client.get_challenge();
+    let connect = [
+        OOB,
+        b"connect 28 5 ",
+        &challenge[..],
+        b" \"\\name\\p\\prx\\127.0.0.1:",
+        server.port.to_string().as_bytes(),
+        userinfo_extra,
+        b"\"\n",
+    ]
+    .concat();
+    assert_eq!(client.ask(&connect), [OOB, b"j"].concat());
+    wait_until("proxy to log the connection", || {
+        proxy.log().contains(": connection")
+    });
+    client
+}
+
 const BASE_CONFIG: &str = "\
 set hostname \"smoke proxy\"
 set masters \"\"
@@ -376,4 +422,127 @@ fn banned_clients_are_ignored() {
 
     client.send(&[OOB, b"ping"].concat());
     assert!(client.try_recv().is_none(), "banned client got a reply");
+}
+
+/// A Q3 client's `connect`: the userinfo carries the challenge, and
+/// everything after `connect ` is Huffman-compressed.
+fn q3_connect_packet(challenge: &[u8], server_port: u16) -> Vec<u8> {
+    let mut packet = [
+        OOB,
+        b"connect \"\\name\\q3p\\protocol\\68\\qport\\5\\challenge\\",
+        challenge,
+        b"\\prx\\127.0.0.1:",
+        server_port.to_string().as_bytes(),
+        b"\"",
+    ]
+    .concat();
+    huff::compress(&mut packet, 12);
+    packet
+}
+
+#[test]
+fn q3_client_is_proxied_end_to_end() {
+    let server = FakeServer::start_q3();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = Client::connect(proxy.addr);
+
+    // A bare "getchallenge" marks the client as Q3.
+    let reply = client.oob(b"getchallenge");
+    let prefix = [OOB, b"challengeResponse "].concat();
+    let challenge = reply
+        .strip_prefix(prefix.as_slice())
+        .unwrap_or_else(|| panic!("unexpected challenge reply {reply:?}"))
+        .to_vec();
+
+    // The first connect starts the proxy's own handshake with the server; the
+    // client hears nothing back until that completes.
+    client.send(&q3_connect_packet(&challenge, server.port));
+    assert!(client.try_recv().is_none(), "no reply expected yet");
+
+    let request = server.wait_for("q3 getchallenge", |d| d == [OOB, b"getchallenge"].concat());
+    assert_eq!(request, [OOB, b"getchallenge"].concat());
+    let mut forwarded = server.wait_for("proxy connect", |d| {
+        d.starts_with(&[OOB, b"connect "].concat())
+    });
+    huff::decompress(&mut forwarded, 12, 8192);
+    assert!(
+        contains(&forwarded, b"\\challenge\\777"),
+        "server challenge not used: {forwarded:?}"
+    );
+    assert!(contains(&forwarded, b"\\*qwfwd\\1.40-dev"), "{forwarded:?}");
+    assert!(
+        !contains(&forwarded, b"\\prx\\"),
+        "prx key leaked: {forwarded:?}"
+    );
+    wait_until("proxy to log connectResponse", || {
+        proxy.log().contains("connectResponse")
+    });
+
+    // Q3 scrambles game packets with the challenge, so a reconnecting client
+    // must be handed the server's challenge, and then gets its connectResponse.
+    assert_eq!(
+        client.oob(b"getchallenge"),
+        [OOB, b"challengeResponse 777"].concat()
+    );
+    let reply = client.ask(&q3_connect_packet(b"777", server.port));
+    assert_eq!(reply, [OOB, b"connectResponse"].concat());
+
+    let reply = client.ask(&game_packet(b"q3hello"));
+    assert!(
+        reply.ends_with(b"echo:q3hello"),
+        "game traffic not relayed: {reply:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_reloads_the_config_and_purges_the_whitelist() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let server = FakeServer::start();
+    let blocking = format!("{BASE_CONFIG}set hostname before\nwhitelistadd 10.9.9.9\n");
+    let proxy = Proxy::start(&blocking, &[]);
+    let client = Client::connect(proxy.addr);
+    assert!(
+        contains(&client.oob(b"status"), b"\\hostname\\before"),
+        "initial hostname"
+    );
+
+    // The whitelist does not include the fake server, so connecting goes nowhere.
+    let challenge = client.get_challenge();
+    let connect = [
+        OOB,
+        b"connect 28 5 ",
+        &challenge[..],
+        b" \"\\name\\p\\prx\\127.0.0.1:",
+        server.port.to_string().as_bytes(),
+        b"\"\n",
+    ]
+    .concat();
+    client.send(&connect);
+    assert!(
+        client.try_recv().is_none(),
+        "connect should be refused silently"
+    );
+    assert!(
+        server.received(|d| d.starts_with(OOB)).is_empty(),
+        "nothing should reach the server"
+    );
+
+    std::fs::write(
+        proxy.dir.join("qwfwd/qwfwd.cfg"),
+        format!("{BASE_CONFIG}set hostname after\n"),
+    )
+    .unwrap();
+    kill(Pid::from_raw(proxy.child.id() as i32), Signal::SIGHUP).unwrap();
+    wait_until("config to be re-executed", || {
+        contains(&client.oob(b"status"), b"\\hostname\\after")
+    });
+    assert_eq!(proxy.log().matches("execing qwfwd.cfg").count(), 2);
+
+    // With the whitelist purged the same connect now goes through.
+    let connected = connect_client(&proxy, &server, b"");
+    let reply = connected.ask(&game_packet(b"hello"));
+    assert!(reply.ends_with(b"echo:hello"), "{reply:?}");
 }
