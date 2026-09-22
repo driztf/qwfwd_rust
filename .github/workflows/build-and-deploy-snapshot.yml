@@ -7,56 +7,50 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-       target: [linux-amd64, linux-i686, linux-armhf, linux-aarch64, windows-x64, windows-x86]
-       include:
-         - target: linux-amd64
-           os: linux
-           arch: amd64
-           build-image: debian:stable
-           ext: ""
-         - target: linux-i686
-           os: linux
-           arch: i686
-           build-image: debian:stable
-           ext: ""
-         - target: linux-armhf
-           os: linux
-           arch: armhf
-           build-image: debian:stable
-           ext: ""
-         - target: linux-aarch64
-           os: linux
-           arch: aarch64
-           build-image: debian:stable
-           ext: ""
-         - target: windows-x64
-           os: windows
-           arch: x64
-           build-image: debian:stable
-           ext: ".exe"
-         - target: windows-x86
-           os: windows
-           arch: x86
-           build-image: debian:stable
-           ext: ".exe"
-    container: ${{ matrix.build-image }}
+        include:
+          - target: linux-amd64
+            triple: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+            ext: ""
+          - target: linux-i686
+            triple: i686-unknown-linux-gnu
+            os: linux
+            arch: i686
+            ext: ""
+          - target: linux-armhf
+            triple: armv7-unknown-linux-gnueabihf
+            os: linux
+            arch: armhf
+            ext: ""
+          - target: linux-aarch64
+            triple: aarch64-unknown-linux-gnu
+            os: linux
+            arch: aarch64
+            ext: ""
+          - target: windows-x64
+            triple: x86_64-pc-windows-gnu
+            os: windows
+            arch: x64
+            ext: ".exe"
+          - target: windows-x86
+            triple: i686-pc-windows-gnu
+            os: windows
+            arch: x86
+            ext: ".exe"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Prepare Build Environemnt
-        run: |
-             apt-get update
-             apt-get -y install build-essential cmake gcc-i686-linux-gnu openssh-client
-             apt-get -y install gcc-arm-linux-gnueabihf libc6-dev-armhf-cross gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-             apt-get -y install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross --locked
       - name: Build
-        shell: bash
-        run: |
-             ./build_cmake.sh ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.triple }}
       - name: Create checksum
         shell: bash
         run: |
-             md5sum build/${{ matrix.target }}/qwfwd${{ matrix.ext }} > build/${{ matrix.target }}/qwfwd.md5
+             md5sum target/${{ matrix.triple }}/release/qwfwd${{ matrix.ext }} > target/${{ matrix.triple }}/release/qwfwd.md5
       - name: Setup SSH
         shell: bash
         env:
@@ -73,10 +67,11 @@ jobs:
         env:
           SSH_AUTH_SOCK: /tmp/ssh_agent.sock
         run: |
+             BIN=target/${{ matrix.triple }}/release
              mkdir -p upload/snapshots/${{ matrix.os }}/${{ matrix.arch }}
              mkdir -p upload/snapshots/latest/${{ matrix.os }}/${{ matrix.arch }}
-             cp build/${{ matrix.target }}/qwfwd${{ matrix.ext }} upload/snapshots/${{ matrix.os }}/${{ matrix.arch }}/${{ env.DATE }}_${GITHUB_SHA::7}_qwfwd${{ matrix.ext }}
-             cp build/${{ matrix.target }}/qwfwd.md5 upload/snapshots/${{ matrix.os }}/${{ matrix.arch }}/${{ env.DATE }}_${GITHUB_SHA::7}_qwfwd.md5
-             cp build/${{ matrix.target }}/qwfwd${{ matrix.ext }} upload/snapshots/latest/${{ matrix.os }}/${{ matrix.arch }}/qwfwd${{ matrix.ext }}
-             cp build/${{ matrix.target }}/qwfwd.md5 upload/snapshots/latest/${{ matrix.os }}/${{ matrix.arch }}/qwfwd.md5
+             cp $BIN/qwfwd${{ matrix.ext }} upload/snapshots/${{ matrix.os }}/${{ matrix.arch }}/${{ env.DATE }}_${GITHUB_SHA::7}_qwfwd${{ matrix.ext }}
+             cp $BIN/qwfwd.md5 upload/snapshots/${{ matrix.os }}/${{ matrix.arch }}/${{ env.DATE }}_${GITHUB_SHA::7}_qwfwd.md5
+             cp $BIN/qwfwd${{ matrix.ext }} upload/snapshots/latest/${{ matrix.os }}/${{ matrix.arch }}/qwfwd${{ matrix.ext }}
+             cp $BIN/qwfwd.md5 upload/snapshots/latest/${{ matrix.os }}/${{ matrix.arch }}/qwfwd.md5
              sftp -rp -o 'StrictHostKeyChecking no' -o 'UserKnownHostsFile /dev/null' -P ${{ secrets.SFTP_PORT }} ${{ secrets.SFTP_USERNAME }}@${{ secrets.SFTP_HOST }}:/snapshots <<< $'put -rp upload/snapshots/*'
