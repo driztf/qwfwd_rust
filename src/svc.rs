@@ -1,470 +1,431 @@
-/*
-	svc.c
-*/
+//! Server-side handling of connectionless packets from clients: challenges,
+//! connection requests, status queries.
 
-#include "qwfwd.h"
+use std::net::SocketAddrV4;
+use std::time::Instant;
 
-/*
-=================
-SVC_GetChallenge
+use tokio::net::UdpSocket;
 
-Returns a challenge number that can be used
-in a subsequent client_connect command.
-We do this to prevent denial of service attacks that
-flood the server with invalid connection IPs.  With a
-challenge, they must give a valid IP address.
-=================
-*/
+use crate::cmd::Args;
+use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
+use crate::peer::{PeerState, Protocol};
+use crate::protocol::{
+    A2A_ACK, A2A_PING, A2C_PRINT, Q3_DEFAULT_SERVER_PORT, QW_DEFAULT_SERVER_PORT,
+    QW_PROTOCOL_VERSION, QW_VERSION, QWFWD_PRX_KEY, QWFWD_VERSION_SHORT, S2C_CHALLENGE,
+    S2C_CONNECTION,
+};
+use crate::proxy::Proxy;
+use crate::query::Query;
+use crate::{dprint, huff, info, net, parse};
 
-// MAX_CHALLENGES is made large to prevent a denial
-// of service attack that could cycle all of them
-// out before legitimate users connected
-#define	MAX_CHALLENGES	1024
+/// Large enough that an attacker cannot cycle out legitimate challenges.
+const MAX_CHALLENGES: usize = 1024;
 
-typedef struct
-{
-	struct sockaddr_in		adr;
-	int						challenge;
-	time_t					time;
-	protocol_t				proto;
-} challenge_t;
+/// Offset of the compressed payload in a Q3 `connect` packet: the -1 header plus `connect `.
+const Q3_CONNECT_PAYLOAD: usize = 12;
 
-static challenge_t		challenges[MAX_CHALLENGES];	// to prevent invalid IPs from connecting
-
-// find challenge for address if any
-static unsigned int FindChallengeForAddr(struct sockaddr_in *addr)
-{
-	unsigned int i;
-
-	for (i = 0; i < MAX_CHALLENGES; i++)
-	{
-		if (NET_CompareAddress(addr, &challenges[i].adr))
-		{
-			break; // found
-		}
-	}
-
-	return i;
+pub struct Challenge {
+    pub addr: SocketAddrV4,
+    pub challenge: i32,
+    pub proto: Protocol,
+    issued_at: Instant,
 }
 
-// see if the challenge is valid
-static qbool CheckChallenge( int challenge )
-{
-	unsigned int i = FindChallengeForAddr(&net_from);
-
-	if (i >= MAX_CHALLENGES)
-	{
-		Netchan_OutOfBandPrint(net_from_socket, &net_from, "%c\nNo challenge for address.\n", A2C_PRINT);
-		return false;
-	}
-
-	if (challenge != challenges[i].challenge)
-	{
-		Netchan_OutOfBandPrint(net_from_socket, &net_from, "%c\nBad challenge.\n", A2C_PRINT);
-		return false;
-	}
-
-	return true; // good!
+#[derive(Default)]
+pub struct Challenges {
+    list: Vec<Challenge>,
 }
 
-static void SVC_GetChallenge ( protocol_t proto )
-{
-	time_t	oldestTime;
-	int		i, oldest;
-	char	buf[256];
+impl Challenges {
+    pub fn find(&self, addr: SocketAddrV4) -> Option<&Challenge> {
+        self.list.iter().find(|c| c.addr == addr)
+    }
 
-	oldest = 0;
-	oldestTime = 0x7fffffff;
-
-	// see if we already have a challenge for this ip
-	for (i = 0 ; i < MAX_CHALLENGES; i++)
-	{
-		if (NET_CompareAddress(&net_from, &challenges[i].adr))
-			break;
-
-		if (challenges[i].time < oldestTime)
-		{
-			oldestTime = challenges[i].time;
-			oldest = i;
-		}
-	}
-
-	if (i == MAX_CHALLENGES)
-	{
-		// overwrite the oldest
-		i = oldest;
-		challenges[i].challenge = (rand() << 16) ^ rand();
-		challenges[i].adr		= net_from;
-		challenges[i].time		= time(NULL);
-	}
-
-	// overwrite proto in any case!
-	challenges[i].proto	= proto;
-
-	if ( challenges[i].proto == pr_q3 )
-	{
-		peer_t *p = FWD_peer_by_addr( &net_from );
-		if ( p && p->ps == ps_connected )
-		{
-			Sys_DPrintf("challenge q3 overwrite trick!\n");
-			challenges[i].challenge = p->challenge; // use challenge from q3 server since q3 packets encrypted with it...
-		}
-	}
-
-	if ( developer->integer )
-	{
-		Sys_DPrintf("challenge %s: %s %d\n", challenges[i].proto == pr_qw ? "qw" : "q3", NET_AdrToString(&net_from, buf, sizeof(buf)), challenges[i].challenge);
-	}
-
-	// send it back
-	if ( challenges[i].proto == pr_qw )
-	{
-		char *over;
-
-		snprintf(buf, sizeof(buf), "%c%i", S2C_CHALLENGE, challenges[i].challenge);
-
-		over = buf + strlen(buf) + 1;
-
-		Netchan_OutOfBand(net_from_socket, &net_from, over-buf, (byte*) buf);
-	}
-	else
-	{
-		Netchan_OutOfBandPrint(net_from_socket, &net_from, "challengeResponse %i", challenges[i].challenge);	
-	}
+    /// Returns the challenge for `addr`, issuing a fresh one when there is
+    /// none (recycling the oldest slot when full). The protocol is always
+    /// updated to the one just requested.
+    fn get_or_issue(&mut self, addr: SocketAddrV4, proto: Protocol) -> &mut Challenge {
+        let index = match self.list.iter().position(|c| c.addr == addr) {
+            Some(i) => i,
+            None => {
+                let fresh = Challenge {
+                    addr,
+                    challenge: rand::random(),
+                    proto,
+                    issued_at: Instant::now(),
+                };
+                if self.list.len() < MAX_CHALLENGES {
+                    self.list.push(fresh);
+                    self.list.len() - 1
+                } else {
+                    let oldest = (0..self.list.len())
+                        .min_by_key(|&i| self.list[i].issued_at)
+                        .expect("challenge list is full, so not empty");
+                    self.list[oldest] = fresh;
+                    oldest
+                }
+            }
+        };
+        let entry = &mut self.list[index];
+        entry.proto = proto;
+        entry
+    }
 }
 
-/*
-==================
-SVC_DirectConnect
+impl Proxy {
+    /// Handles an out-of-band packet from a client. Returns whether the packet
+    /// should also be forwarded to the client's remote server.
+    pub async fn sv_connectionless(
+        &mut self,
+        socket: &UdpSocket,
+        from: SocketAddrV4,
+        msg: &mut Vec<u8>,
+    ) -> bool {
+        if Query::is_master_reply(msg) {
+            self.query.parse_master_reply(&self.cvars, from, msg);
+            return false;
+        }
 
-A connection request that did not come from the master
-==================
-*/
+        let mut text = {
+            let mut reader = MsgReader::new(msg);
+            reader.read_long();
+            reader.read_string()
+        };
 
-static qbool CheckProtocol( int ver, protocol_t proto )
-{
-	if ( proto == pr_qw )
-	{
-		if (ver != QW_PROTOCOL_VERSION)
-		{
-			Netchan_OutOfBandPrint (net_from_socket, &net_from, "%c\nServer is version " QW_VERSION ".\n", A2C_PRINT);
-			Sys_DPrintf ("* rejected connect from version %i\n", ver);
-			return false;
-		}
-	}
-	else
-	{
-#if 0 // who care which version it is?
-		if (ver != 68)
-		{
-			Netchan_OutOfBandPrint (net_from_socket, &net_from, "%c\nServer is version 68.\n", A2C_PRINT);
-			Sys_DPrintf ("* rejected connect from version %i\n", ver);
-			return false;
-		}
-#endif
-	}
+        // Q3 clients Huffman-compress everything after "connect ".
+        if text.starts_with(b"connect ")
+            && self
+                .challenges
+                .find(from)
+                .is_some_and(|c| c.proto == Protocol::Q3)
+        {
+            huff::decompress(msg, Q3_CONNECT_PAYLOAD, MSG_BUF_SIZE);
+            let mut reader = MsgReader::new(msg);
+            reader.read_long();
+            text = reader.read_string();
+        }
 
-	return true;
+        let args = Args::tokenize(&text);
+        match args.arg(0) {
+            b"ping" | [A2A_PING] => self.svc_ping(socket, from),
+            b"pingstatus" => self.query.ping_status(&self.cvars, socket, from),
+            b"connect" => self.svc_direct_connect(socket, from, &args).await,
+            b"getchallenge" => {
+                let proto = if text == b"getchallenge\n" {
+                    Protocol::Qw
+                } else {
+                    Protocol::Q3
+                };
+                self.svc_get_challenge(socket, from, proto);
+            }
+            b"status" => self.svc_status(socket, from, &args),
+            // There is no proxy rcon; the remote server gets to decide.
+            b"rcon" => return true,
+            _ => {}
+        }
+        false
+    }
+
+    fn svc_ping(&self, socket: &UdpSocket, from: SocketAddrV4) {
+        net::send(socket, &[A2A_ACK], from);
+    }
+
+    fn svc_get_challenge(&mut self, socket: &UdpSocket, from: SocketAddrV4, proto: Protocol) {
+        // Q3 game packets are scrambled with the challenge, so a reconnecting
+        // client must be handed the challenge the remote server issued.
+        let server_challenge = match proto {
+            Protocol::Q3 => self
+                .peer_by_addr(from)
+                .filter(|p| p.state == PeerState::Connected)
+                .map(|p| p.challenge),
+            Protocol::Qw => None,
+        };
+
+        let entry = self.challenges.get_or_issue(from, proto);
+        if let Some(challenge) = server_challenge {
+            dprint!("challenge q3 overwrite trick!\n");
+            entry.challenge = challenge;
+        }
+        let challenge = entry.challenge;
+        dprint!(
+            "challenge {}: {from} {challenge}\n",
+            match proto {
+                Protocol::Qw => "qw",
+                Protocol::Q3 => "q3",
+            }
+        );
+
+        match proto {
+            Protocol::Qw => {
+                let mut reply = format!("{}{challenge}", S2C_CHALLENGE as char).into_bytes();
+                reply.push(0);
+                net::send_oob(socket, from, &reply);
+            }
+            Protocol::Q3 => {
+                net::send_oob_print(socket, from, &format!("challengeResponse {challenge}"));
+            }
+        }
+    }
+
+    fn check_protocol(
+        &self,
+        socket: &UdpSocket,
+        from: SocketAddrV4,
+        version: i32,
+        proto: Protocol,
+    ) -> bool {
+        if proto == Protocol::Qw && version != QW_PROTOCOL_VERSION {
+            print_to(
+                socket,
+                from,
+                &format!("\nServer is version {QW_VERSION}.\n"),
+            );
+            dprint!("* rejected connect from version {version}\n");
+            return false;
+        }
+        true
+    }
+
+    fn check_challenge(&self, socket: &UdpSocket, from: SocketAddrV4, challenge: i32) -> bool {
+        match self.challenges.find(from) {
+            None => {
+                print_to(socket, from, "\nNo challenge for address.\n");
+                false
+            }
+            Some(c) if c.challenge != challenge => {
+                print_to(socket, from, "\nBad challenge.\n");
+                false
+            }
+            Some(_) => true,
+        }
+    }
+
+    fn check_userinfo(
+        &self,
+        socket: &UdpSocket,
+        from: SocketAddrV4,
+        userinfo: &[u8],
+    ) -> Option<Vec<u8>> {
+        if !info::validate(userinfo) {
+            print_to(socket, from, "\nInvalid userinfo. Restart your qwcl\n");
+            return None;
+        }
+        Some(userinfo.to_vec())
+    }
+
+    async fn svc_direct_connect(&mut self, socket: &UdpSocket, from: SocketAddrV4, args: &Args) {
+        let Some(entry) = self.challenges.find(from) else {
+            print_to(socket, from, "\nNo challenge for address.\n");
+            return;
+        };
+        let (proto, challenge) = (entry.proto, entry.challenge);
+
+        let (mut userinfo, qport) = match proto {
+            Protocol::Qw => {
+                if !self.check_protocol(socket, from, parse::atoi(args.arg(1)), proto) {
+                    return;
+                }
+                let qport = parse::atoi(args.arg(2));
+                if !self.check_challenge(socket, from, parse::atoi(args.arg(3))) {
+                    return;
+                }
+                let Some(userinfo) = self.check_userinfo(socket, from, args.arg(4)) else {
+                    return;
+                };
+                (userinfo, qport)
+            }
+            Protocol::Q3 => {
+                let Some(userinfo) = self.check_userinfo(socket, from, args.arg(1)) else {
+                    return;
+                };
+                let value = |key: &[u8]| parse::atoi(info::value_for_key(&userinfo, key));
+                if !self.check_protocol(socket, from, value(b"protocol"), proto) {
+                    return;
+                }
+                let qport = value(b"qport");
+                if !self.check_challenge(socket, from, value(b"challenge")) {
+                    return;
+                }
+                (userinfo, qport)
+            }
+        };
+
+        if self.peers.len() >= self.max_clients() {
+            print_to(
+                socket,
+                from,
+                &format!("\nproxy@{} is full\n\n", self.cvars.string("hostname")),
+            );
+            return;
+        }
+
+        let prx = info::value_for_key(&userinfo, QWFWD_PRX_KEY).to_vec();
+        if prx.is_empty() {
+            match proto {
+                Protocol::Qw => print_to(socket, from, "\nprx userinfo key is not set\n"),
+                Protocol::Q3 => {
+                    net::send_oob_print(socket, from, "print\nprx userinfo key is not set\n")
+                }
+            }
+            return;
+        }
+
+        // "a@b@c" chains proxies: connect to a and hand the rest on as the new prx key.
+        let target: &[u8] = match prx.iter().position(|&b| b == b'@') {
+            Some(at) if at + 1 < prx.len() => {
+                info::set_value_for_key(
+                    &mut userinfo,
+                    QWFWD_PRX_KEY,
+                    &prx[at + 1..],
+                    info::MAX_INFO_STRING,
+                    false,
+                );
+                &prx[..at]
+            }
+            _ => {
+                info::remove_key(&mut userinfo, QWFWD_PRX_KEY);
+                &prx
+            }
+        };
+
+        let (host, port) = match target.iter().position(|&b| b == b':') {
+            Some(colon) => (&target[..colon], parse::atoi(&target[colon + 1..])),
+            None => (
+                target,
+                match proto {
+                    Protocol::Qw => QW_DEFAULT_SERVER_PORT,
+                    Protocol::Q3 => Q3_DEFAULT_SERVER_PORT,
+                },
+            ),
+        };
+        let Ok(port) = u16::try_from(port).ok().filter(|&p| p > 0).ok_or(()) else {
+            print_to(
+                socket,
+                from,
+                "\nport number in prx userinfo key is invalid\n",
+            );
+            return;
+        };
+
+        // Let the remote server see that this client arrives through qwfwd.
+        info::set_value_for_star_key(
+            &mut userinfo,
+            b"*qwfwd",
+            QWFWD_VERSION_SHORT.as_bytes(),
+            info::MAX_INFO_STRING,
+            true,
+        );
+
+        let host = String::from_utf8_lossy(host).into_owned();
+        let Some(index) = self
+            .peer_new(&host, port, from, &userinfo, qport, proto)
+            .await
+        else {
+            dprint!("peer {from} was not added\n");
+            return;
+        };
+        dprint!("peer {from} added or reused\n");
+
+        match proto {
+            Protocol::Qw => {
+                net::send_oob_print(socket, from, &(S2C_CONNECTION as char).to_string())
+            }
+            Protocol::Q3 => {
+                let peer = &self.peers[index];
+                if peer.state == PeerState::Connected {
+                    if peer.challenge == challenge {
+                        net::send_oob_print(socket, from, "connectResponse");
+                    } else {
+                        // The client must come back with the server's challenge.
+                        net::send_oob_print(socket, from, "print\n/reconnect ASAP!\n");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answers a `status` query the way a QuakeWorld server would, so server
+    /// browsers can list the proxy and its clients.
+    fn svc_status(&self, socket: &UdpSocket, from: SocketAddrV4, args: &Args) {
+        const OLDSTYLE: i32 = 0;
+        const SERVERINFO: i32 = 1;
+        const PLAYERS: i32 = 2;
+        const SPECTATORS: i32 = 4;
+
+        let mut msg = MsgWriter::out_of_band(MSG_BUF_SIZE);
+        msg.write_byte(A2C_PRINT);
+
+        let opt = if args.argc() > 1 {
+            parse::atoi(args.arg(1))
+        } else {
+            OLDSTYLE
+        };
+
+        if opt == OLDSTYLE || opt & SERVERINFO != 0 {
+            let mut line = self.cvars.serverinfo.clone();
+            line.push(b'\n');
+            msg.print(&line);
+        }
+
+        if opt == OLDSTYLE || opt & (PLAYERS | SPECTATORS) != 0 {
+            for peer in &self.peers {
+                let (frags, ping, skin) = (0, 666, "");
+                let mut line = format!(
+                    "{} {frags} {} {ping} \"",
+                    peer.userid,
+                    peer.minutes_connected()
+                )
+                .into_bytes();
+                line.extend_from_slice(&peer.name);
+                line.extend_from_slice(
+                    format!("\" \"{skin}\" {} {}\n", peer.top_color, peer.bottom_color).as_bytes(),
+                );
+                msg.print(&line);
+            }
+        }
+
+        if !msg.overflowed() {
+            net::send(socket, msg.as_bytes(), from);
+        }
+    }
 }
 
-static qbool CheckUserinfo( char *userinfobuf, unsigned int bufsize, char *userinfo )
-{
-	strlcpy (userinfobuf, userinfo, bufsize);
-
-	// and now validate userinfo
-	if ( !ValidateUserInfo( userinfobuf ) )
-	{
-		Netchan_OutOfBandPrint (net_from_socket, &net_from, "%c\nInvalid userinfo. Restart your qwcl\n", A2C_PRINT);
-		return false;
-	}
-
-	return true;
+/// Sends an `A2C_PRINT` message to a client.
+fn print_to(socket: &UdpSocket, to: SocketAddrV4, text: &str) {
+    let mut data = vec![A2C_PRINT];
+    data.extend_from_slice(text.as_bytes());
+    net::send_oob(socket, to, &data);
 }
 
-static void SVC_DirectConnect (void)
-{
-	unsigned int i = FindChallengeForAddr(&net_from);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
 
-	char userinfo[MAX_INFO_STRING], prx[MAX_INFO_KEY * 4 /* we allow huge size for prx */], *at;
-	peer_t *p = NULL;
-	int qport, port, challenge;
-	protocol_t proto;
+    fn addr(last: u8) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, last), 27001)
+    }
 
-	if ( i >= MAX_CHALLENGES )
-	{
-		// here protocol is unknown
-		Netchan_OutOfBandPrint(net_from_socket, &net_from, "%c\nNo challenge for address.\n", A2C_PRINT);
-		return;
-	}
+    #[test]
+    fn challenges_are_stable_per_address_and_recycle_oldest() {
+        let mut challenges = Challenges::default();
+        let first = challenges.get_or_issue(addr(1), Protocol::Qw).challenge;
+        assert_eq!(
+            challenges.get_or_issue(addr(1), Protocol::Q3).challenge,
+            first
+        );
+        assert_eq!(challenges.find(addr(1)).unwrap().proto, Protocol::Q3);
 
-	proto = challenges[i].proto;
-	challenge = challenges[i].challenge;
-
-	// different for qw and q3
-	if ( proto == pr_qw )
-	{
-		// check version/protocol
-		if ( !CheckProtocol( atoi( Cmd_Argv( 1 ) ), proto ) )
-			return; // wrong protocol number
-
-		// get qport
-		qport = atoi( Cmd_Argv( 2 ) );
-
-		// see if the challenge is valid
-		if ( !CheckChallenge( atoi( Cmd_Argv( 3 ) ) ) )
-			return; // wrong challenge
-
-		// and now validate userinfo
-		if ( !CheckUserinfo( userinfo, sizeof( userinfo ), Cmd_Argv( 4 ) ) )
-			return; // wrong userinfo
-	}
-	else
-	{
-		// and now validate userinfo
-		if ( !CheckUserinfo( userinfo, sizeof( userinfo ), Cmd_Argv( 1 ) ) )
-			return; // wrong userinfo
-
-		// check version/protocol
-		if ( !CheckProtocol( atoi( Info_ValueForKey(userinfo, "protocol", prx, sizeof(prx)) ), proto ) )
-			return; // wrong protocol number
-
-		// get qport
-		qport = atoi( Info_ValueForKey(userinfo, "qport", prx, sizeof(prx)) );
-
-		// see if the challenge is valid
-		if ( !CheckChallenge( atoi( Info_ValueForKey(userinfo, "challenge", prx, sizeof(prx)) ) ) )
-			return; // wrong challenge
-	}
-
-	// check proxy is full
-	if (FWD_peers_count() >= maxclients->integer)
-	{
-		Netchan_OutOfBandPrint (net_from_socket, &net_from, "%c\n" "proxy@%s is full\n\n", A2C_PRINT, hostname->string);
-		return; // no more free slots
-	}
-
-	// check prx setinfo key
-	Info_ValueForKey(userinfo, QWFWD_PRX_KEY, prx, sizeof(prx));
-	if (!prx[0])
-	{
-		if ( proto == pr_qw )
-		{
-			Netchan_OutOfBandPrint (net_from_socket, &net_from, "%c\n" QWFWD_PRX_KEY " userinfo key is not set\n", A2C_PRINT);
-		}
-		else
-		{
-			Netchan_OutOfBandPrint (net_from_socket, &net_from, "print\n" QWFWD_PRX_KEY " userinfo key is not set\n");
-		}
-		return; // no proxy set
-	}
-
-	// check chaining
-	if ((at = strchr(prx, '@')) && at[1])
-	{
-		Info_SetValueForKeyEx(userinfo, QWFWD_PRX_KEY, at+1, sizeof(userinfo), false);
-		at[0] = 0; // truncate proxy chains
-	}
-	else
-	{
-		Info_RemoveKey(userinfo, QWFWD_PRX_KEY);
-	}
-
-	// guess port
-	if ((at = strchr(prx, ':')))
-	{
-		at[0] = 0; // truncate port from proxy name
-		port = atoi(at + 1);
-	}
-	else
-	{
-		port = ( proto == pr_qw ) ? 27500 : 27960;
-	}
-
-	if (port < 1)
-	{
-		Netchan_OutOfBandPrint (net_from_socket, &net_from, "%c\nport number in " QWFWD_PRX_KEY " userinfo key is invalid\n", A2C_PRINT);
-		return; // something wrong with port
-	}
-
-	// put some identifier in userinfo so server/proxy can detect that client use qwfwd.
-	Info_SetValueForStarKey(userinfo, "*qwfwd", QWFWD_VERSION_SHORT, sizeof(userinfo));
-
-	// build a new connection
-
-	// this was new peer, lets register it then
-	if ((p = FWD_peer_new(prx, port, &net_from, userinfo, qport, proto, true)))
-	{
-		Sys_DPrintf("peer %s:%d added or reused\n", inet_ntoa(net_from.sin_addr), (int)ntohs(net_from.sin_port));
-	}
-	else
-	{
-		Sys_DPrintf("peer %s:%d was not added\n", inet_ntoa(net_from.sin_addr), (int)ntohs(net_from.sin_port));
-		return;
-	}
-
-	if ( proto == pr_qw )
-	{
-		Netchan_OutOfBandPrint(net_from_socket, &net_from, "%c", S2C_CONNECTION);
-	}
-	else
-	{
-		if ( p->ps == ps_connected )
-		{
-			if ( p->challenge == challenge )
-			{
-				// ok, we are really really ready to transfer data
-				Netchan_OutOfBandPrint(net_from_socket, &net_from, "connectResponse");
-			}
-			else
-			{
-				// tell client we are ready. just type /reconnect on the console!
-				Netchan_OutOfBandPrint(net_from_socket, &net_from, "print\n" "/reconnect ASAP!\n");
-			}
-		}
-	}
+        for i in 2..=255 {
+            challenges.get_or_issue(addr(i), Protocol::Qw);
+        }
+        for port in 1..=(MAX_CHALLENGES as u16) {
+            challenges.get_or_issue(
+                SocketAddrV4::new(Ipv4Addr::new(10, 1, 0, 1), port),
+                Protocol::Qw,
+            );
+        }
+        assert_eq!(challenges.list.len(), MAX_CHALLENGES);
+        assert!(challenges.find(addr(1)).is_none());
+    }
 }
-
-/*
-================
-SVC_Status
-
-Responds with all the info that qplug or qspy can see
-This message can be up to around 5k with worst case string lengths.
-================
-*/
-#define STATUS_OLDSTYLE					0
-#define	STATUS_SERVERINFO				1
-#define	STATUS_PLAYERS					2
-#define	STATUS_SPECTATORS				4
-//#define STATUS_SPECTATORS_AS_PLAYERS	8 //for ASE - change only frags: show as "S"
-//#define STATUS_SHOWTEAMS				16
-
-static void SVC_Status (void)
-{
-	sizebuf_t buf;
-
-	static byte buf_data[MSG_BUF_SIZE]; // static  - so it not allocated each time
-	static char tmp[1024]; // static too
-
-	int top, bottom, ping, opt, connect_t;
-	char *name, *frags, *skin;
-	peer_t *cl;
-
-	SZ_InitEx(&buf, buf_data, sizeof(buf_data), true);
-
-	MSG_WriteLong(&buf, -1);	// -1 sequence means out of band
-	MSG_WriteChar(&buf, A2C_PRINT);
-
-	opt = (Cmd_Argc() > 1) ? atoi(Cmd_Argv(1)) : 0;
-
-	if (opt == STATUS_OLDSTYLE || (opt & STATUS_SERVERINFO))
-	{
-		snprintf(tmp, sizeof(tmp), "%s\n", ps.info);
-		SZ_Print(&buf, tmp);
-	}
-
-	if (opt == STATUS_OLDSTYLE || (opt & (STATUS_PLAYERS | STATUS_SPECTATORS)))
-	{
-		for (cl = peers; cl; cl = cl->next)
-		{
-			top    = cl->top;
-			bottom = cl->bottom;
-			ping   = 666; //SV_CalcPing (cl);
-			name   = cl->name;
-			skin   = "";
-			frags  = "0";
-			connect_t = (int)(time(NULL) - cl->connect)/60; // not like it proper...
-
-			snprintf(tmp, sizeof(tmp), "%i %s %i %i \"%s\" \"%s\" %i %i\n", cl->userid, frags, connect_t, ping, name, skin, top, bottom);
-
-			SZ_Print(&buf, tmp);
-		}
-	}
-
-	if (buf.overflowed)
-		return; // overflowed
-
-	// send the datagram
-	NET_SendPacket(net_from_socket, buf.cursize, buf.data, &net_from);
-}
-
-/*
-================
-SVC_Ping
-
-Just responds with an acknowledgement
-================
-*/
-static void SVC_Ping (void)
-{
-	char data = A2A_ACK;
-
-	NET_SendPacket(net_from_socket, 1, &data, &net_from);
-}
-
-/*
-=================
-SV_ConnectionlessPacket
-
-A connectionless packet has four leading 0xff
-characters to distinguish it from a game channel.
-Clients that are in the game can still send
-connectionless packets.
-=================
-*/
-
-qbool SV_ConnectionlessPacket(void)
-{
-	qbool need_forward = false;
-	char	*s;
-	char	*c;
-
-	MSG_BeginReading ();
-
-	if (QRY_IsMasterReply())
-	{
-		SVC_QRY_ParseMasterReply();
-	}
-	else
-	{
-		MSG_ReadLong ();		// skip the -1 marker
-
-		s = MSG_ReadString ();//MSG_ReadStringLine ();
-
-		// check for possibile huffmen compression for q3, zzz...
-		if ( s[0] == 'c' && !strncmp(s, "connect ", sizeof("connect ")-1) )
-		{
-			unsigned int i = FindChallengeForAddr(&net_from);
-
-			if ( i < MAX_CHALLENGES && challenges[i].proto == pr_q3 )
-			{
-				Huff_DecryptPacket(&net_message, 12);
-				MSG_BeginReading();
-				MSG_ReadLong();
-				s = MSG_ReadString ();//MSG_ReadStringLine ();
-			}
-		}
-
-//		Sys_Printf ("SV connectionless packet from %s:\n%s\n", inet_ntoa(net_from.sin_addr), s);
-
-		Cmd_TokenizeString (s);
-
-		c = Cmd_Argv(0);
-
-		if (!strcmp(c, "ping") || ( c[0] == A2A_PING && (c[1] == 0 || c[1] == '\n') ) )
-			SVC_Ping();
-		else if (!strcmp(c, "pingstatus"))
-			SVC_QRY_PingStatus();
-		else if (!strcmp(c,"connect"))
-			SVC_DirectConnect();
-		else if (!strcmp(c,"getchallenge"))
-			SVC_GetChallenge( !strcmp(s,"getchallenge\n") ? pr_qw : pr_q3 );
-		else if (!strcmp(c,"status"))
-			SVC_Status();
-		else if (!strcmp(c,"rcon"))
-			need_forward = true; // we do not have own rcon command, we forward it to the server...
-	}
-
-	return need_forward;
-}
-

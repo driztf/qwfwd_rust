@@ -1,523 +1,423 @@
-// ban.c - banning related code, boldly stolen from mvdsv
+//! IP filters: banned networks and "safe" networks that can never be banned.
+//!
+//! Filters are dotted quads where a zero octet matches anything, so
+//! `addip 192.246.40` covers a whole class C.
 
-#include "qwfwd.h"
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/*
-==============================================================================
+use crate::cmd::Args;
+use crate::console::{developer, qstr};
+use crate::proxy::Proxy;
+use crate::{cprint, dprint, parse};
 
-PACKET FILTERING
+const LISTIP_NAME: &str = "qwfwd_listip.cfg";
+const MAX_IPFILTERS: usize = 1024;
 
-
-You can add or remove addresses from the filter list with:
-
-addip <ip>
-removeip <ip>
-
-The ip address is specified in dot format, and any unspecified digits will match any value, so you can specify an entire class C network with "addip 192.246.40".
-
-Removeip will only remove an address specified exactly the same way.  You cannot addip a subnet, then removeip a single host.
-
-listip
-Prints the current list of filters.
-
-writeip
-Dumps "addip <ip>" commands to listip.cfg so it can be execed at a later date.  The filter lists are not saved and restored by default, because I beleive it would cause too much confusion.
-
-filterban <0 or 1>
-
-If 1 (the default), then ip addresses matching the current list will be prohibited from entering the game.  This is the default setting.
-
-If 0, then only addresses matching the list will be allowed.  This lets you easily set up a private game, or a game that only allows players from your local network.
-
-
-==============================================================================
-*/
-
-#define LISTIP_NAME "qwfwd_listip.cfg"
-
-#define	MAX_IPFILTERS	1024
-
-typedef enum
-{
-	ipft_ban,
-	ipft_safe
-} ipfiltertype_t;
-
-typedef struct
-{
-	unsigned	mask;
-	unsigned	compare;
-//	int			level;
-	double		time; // for ban expiration
-	ipfiltertype_t type;
-} ipfilter_t;
-
-
-static ipfilter_t	ipfilters[MAX_IPFILTERS];
-static int			numipfilters;
-
-//cvar_t	filterban = {"filterban", "1"};
-
-/*
-=================
-SV_FilterPacket
-=================
-*/
-qbool SV_IsBanned (struct sockaddr_in *addr)
-{
-	int				i;
-	unsigned int	in;
-
-	in = addr->sin_addr.s_addr;
-
-	for (i=0 ; i<numipfilters ; i++)
-	{
-		if ( ipfilters[i].type == ipft_ban && (in & ipfilters[i].mask) == ipfilters[i].compare )
-		{
-			if (developer->integer > 1)
-				Sys_DPrintf("banned %s:%d\n", inet_ntoa(addr->sin_addr), (int)ntohs(addr->sin_port));
-
-//			return (int)filterban.value;
-			return true;
-		}
-	}
-
-//	return !(int)filterban.value;
-	return false;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterKind {
+    Ban,
+    Safe,
 }
 
-
-/*
-=================
-StringToFilter
-=================
-*/
-static qbool StringToFilter (char *s, ipfilter_t *f)
-{
-	char	num[128];
-	int		i, j;
-	unsigned char	b[4];
-	unsigned char	m[4];
-
-	for (i=0 ; i<4 ; i++)
-	{
-		b[i] = 0;
-		m[i] = 0;
-	}
-
-	for (i=0 ; i<4 ; i++)
-	{
-		if (*s < '0' || *s > '9')
-		{
-			//Sys_Printf("Bad filter address: %s\n", s);
-			return false;
-		}
-
-		j = 0;
-		while (*s >= '0' && *s <= '9')
-		{
-			num[j++] = *s++;
-		}
-		num[j] = 0;
-		b[i] = atoi(num);
-		if (b[i] != 0)
-			m[i] = 255;
-
-		if (!*s)
-			break;
-		s++;
-	}
-
-	f->mask = *(unsigned *)m;
-	f->compare = *(unsigned *)b;
-
-	return true;
+impl FilterKind {
+    fn label(self) -> &'static str {
+        match self {
+            FilterKind::Ban => " ban",
+            FilterKind::Safe => "safe",
+        }
+    }
 }
 
-/*
-=================
-SV_AddIP_f
-=================
-*/
-static void SV_AddIP_f (void)
-{
-	int		i;
-	double	t = 0;
-	char	*s;
-	time_t	long_time = time(NULL);
-	ipfilter_t f;
-	ipfiltertype_t ipft = ipft_ban; // default is ban
-
-	if (!StringToFilter (Cmd_Argv(1), &f) || f.compare == 0)
-	{
-		Sys_Printf("Bad filter address: %s\n", Cmd_Argv(1));
-		return;
-	}
-
-	s = Cmd_Argv(2);
-	if ( !s[0] || !strcmp(s, "ban"))
-		ipft = ipft_ban;
-	else if (!strcmp(s, "safe"))
-		ipft = ipft_safe;
-	else {
-		Sys_Printf("Wrong filter type %s, use ban or safe\n", Cmd_Argv(2));
-		return;
-	}
-
-	s = Cmd_Argv(3);
-	if (long_time > 0)
-	{
-		if (*s == '+')     // "addip 127.0.0.1 ban +10" will ban for 10 seconds from current time
-			s++;
-		else
-			long_time = 0; // "addip 127.0.0.1 ban 1234567" will ban for some seconds since 00:00:00 GMT, January 1, 1970
-
-		t = (sscanf(s, "%lf", &t) == 1) ? t + long_time : 0;
-	}
-
-	f.time = t;
-	f.type = ipft;
-
-	for (i=0 ; i<numipfilters ; i++)
-		if (ipfilters[i].compare == 0xffffffff || (ipfilters[i].mask == f.mask && ipfilters[i].compare == f.compare))
-			break;		// free spot
-
-	if (i == numipfilters)
-	{
-		if (numipfilters == MAX_IPFILTERS)
-		{
-			Sys_Printf("IP filter list is full\n");
-			return;
-		}
-		numipfilters++;
-	}
-
-	ipfilters[i] = f;
+#[derive(Clone, Copy, Debug)]
+struct IpFilter {
+    compare: [u8; 4],
+    mask: [u8; 4],
+    /// Unix time of expiry; zero means permanent.
+    expires: f64,
+    kind: FilterKind,
 }
 
-/*
-=================
-SV_RemoveIP_f
-=================
-*/
-static void SV_RemoveIP_f (void)
-{
-	ipfilter_t	f;
-	int			i, j;
+impl IpFilter {
+    fn matches(&self, ip: Ipv4Addr) -> bool {
+        ip.octets()
+            .iter()
+            .zip(self.mask)
+            .zip(self.compare)
+            .all(|((&octet, mask), compare)| octet & mask == compare)
+    }
 
-	if (!StringToFilter (Cmd_Argv(1), &f))
-	{
-		Sys_Printf("Bad filter address: %s\n", Cmd_Argv(1));
-		return;
-	}
+    fn same_rule(&self, other: &IpFilter) -> bool {
+        self.mask == other.mask && self.compare == other.compare
+    }
 
-	for (i=0 ; i<numipfilters ; i++)
-	{
-		if (ipfilters[i].mask == f.mask && ipfilters[i].compare == f.compare)
-		{
-			for (j=i+1 ; j<numipfilters ; j++)
-				ipfilters[j-1] = ipfilters[j];
-			numipfilters--;
-			Sys_Printf("Removed.\n");
-			return;
-		}
-	}
-
-	Sys_Printf("Didn't find %s.\n", Cmd_Argv(1));
+    fn ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.compare)
+    }
 }
 
-/*
-=================
-SV_ListIP_f
-=================
-*/
-static void SV_ListIP_f (void)
-{
-	time_t	long_time = time(NULL);
-	int		i;
-	unsigned char	b[4];
-
-	Sys_Printf("Filter list:\n");
-	for (i=0 ; i<numipfilters ; i++)
-	{
-		*(unsigned *)b = ipfilters[i].compare;
-		Sys_Printf("%3i.%3i.%3i.%3i | ", b[0], b[1], b[2], b[3]);
-		switch((int)ipfilters[i].type)
-		{
-			case ipft_ban:  Sys_Printf(" ban"); break;
-			case ipft_safe: Sys_Printf("safe"); break;
-			default: Sys_Printf("unkn"); break;
-		}
-		if (ipfilters[i].time)
-			Sys_Printf(" | %i s", (int)(ipfilters[i].time-long_time));
-
-		Sys_Printf("\n");
-	}
+fn parse_filter(s: &[u8]) -> Option<([u8; 4], [u8; 4])> {
+    let mut compare = [0u8; 4];
+    let mut mask = [0u8; 4];
+    let mut i = 0;
+    for octet in 0..4 {
+        if !s.get(i).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        let start = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        compare[octet] = parse::atoi(&s[start..i]) as u8;
+        if compare[octet] != 0 {
+            mask[octet] = 255;
+        }
+        if i >= s.len() {
+            break;
+        }
+        i += 1;
+    }
+    Some((compare, mask))
 }
 
-/*
-=================
-SV_WriteIP_f
-=================
-*/
-static void SV_WriteIP_f (void)
-{
-	FILE	*f;
-	char	name[1024], *s;
-	unsigned char	b[4];
-	int		i;
-
-	snprintf (name, sizeof(name), "%s", LISTIP_NAME);
-
-	Sys_Printf("Writing %s.\n", name);
-
-	f = fopen (name, "wb");
-	if (!f)
-	{
-		Sys_Printf("Couldn't open %s\n", name);
-		return;
-	}
-
-	// write safe filters first
-	for (i=0 ; i<numipfilters ; i++)
-	{
-		if(ipfilters[i].type != ipft_safe)
-			continue;
-
-		*(unsigned *)b = ipfilters[i].compare;
-		fprintf (f, "addip %i.%i.%i.%i safe %.0f\n", b[0], b[1], b[2], b[3], ipfilters[i].time);
-	}
-
-	for (i=0 ; i<numipfilters ; i++)
-	{
-		if(ipfilters[i].type == ipft_safe)
-			continue; // ignore safe, we already save it
-
-		switch((int)ipfilters[i].type)
-		{
-			case ipft_ban:  s = " ban"; break;
-			case ipft_safe: s = "safe"; break;
-			default: s = "unkn"; break;
-		}
-		*(unsigned *)b = ipfilters[i].compare;
-		fprintf (f, "addip %i.%i.%i.%i %s %.0f\n", b[0], b[1], b[2], b[3], s, ipfilters[i].time);
-	}
-
-	fclose (f);
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
-static void Do_BanList(ipfiltertype_t ipft)
-{
-	time_t	long_time = time(NULL);
-	int		i;
-	unsigned char	b[4];
-
-	for (i=0 ; i<numipfilters ; i++)
-	{
-		if (ipfilters[i].type != ipft)
-			continue;
-
-		*(unsigned *)b = ipfilters[i].compare;
-		Sys_Printf("%3i|%3i.%3i.%3i.%3i", i, b[0], b[1], b[2], b[3]);
-		switch((int)ipfilters[i].type)
-		{
-			case ipft_ban:  Sys_Printf("| ban"); break;
-			case ipft_safe: Sys_Printf("|safe"); break;
-			default: Sys_Printf("|unkn"); break;
-		}
-
-		if (ipfilters[i].time)
-		{
-			long df = ipfilters[i].time-long_time;
-			long d, h, m, s;
-			d = df / (60*60*24);
-			df -= d * 60*60*24;
-			h = df / (60*60);
-			df -= h * 60*60;
-			m = df /  60;
-			df -= m * 60;
-			s = df;
-
-			if (d)
-				Sys_Printf("|%4ldd:%2ldh", d, h);
-			else if (h)
-				Sys_Printf("|%4ldh:%2ldm", h, m);
-			else
-				Sys_Printf("|%4ldm:%2lds", m, s);
-		}
-		else
-		{
-			Sys_Printf("|permanent");
-		}
-
-		Sys_Printf("\n");
-	}
+fn padded_ip(ip: Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("{:3}.{:3}.{:3}.{:3}", o[0], o[1], o[2], o[3])
 }
 
-static void SV_BanList_f (void)
-{
-	unsigned char blist[64] = "Ban list:", id[64] = "id", ipmask[64] = "ip mask", type[64] = "type", expire[64] = "expire";
-
-	if (numipfilters < 1)
-	{
-		Sys_Printf("Ban list: empty\n");
-		return;
-	}
-
-	Sys_Printf("%s\n"
-				"\235\236\236\236\236\236\236\236\236\236\236\236\236\236\236\236"
-				"\236\236\236\236\236\236\236\236\236\236\236\236\236\236\236\236\236\237\n"
-				"%3.3s|%15.15s|%4.4s|%9.9s\n",
-				blist, id, ipmask, type, expire);
-
-	Do_BanList(ipft_safe);
-	Do_BanList(ipft_ban);
+#[derive(Default)]
+pub struct Bans {
+    filters: Vec<IpFilter>,
 }
 
-static qbool SV_CanAddBan (ipfilter_t *f)
-{
-	int i;
+impl Bans {
+    pub fn is_banned(&self, addr: SocketAddrV4) -> bool {
+        let banned = self
+            .filters
+            .iter()
+            .any(|f| f.kind == FilterKind::Ban && f.matches(*addr.ip()));
+        if banned && developer() > 1 {
+            dprint!("banned {addr}\n");
+        }
+        banned
+    }
 
-	if (f->compare == 0)
-		return false;
+    pub fn clean_expired(&mut self) {
+        let now = unix_now();
+        self.filters.retain(|f| f.expires == 0.0 || f.expires > now);
+    }
 
-	for (i=0 ; i<numipfilters ; i++)
-		if (ipfilters[i].mask == f->mask && ipfilters[i].compare == f->compare && ipfilters[i].type == ipft_safe)
-			return false; // can't add filter f because present "safe" filter
+    fn can_add_ban(&self, filter: &IpFilter) -> bool {
+        filter.compare != [0; 4]
+            && !self
+                .filters
+                .iter()
+                .any(|f| f.same_rule(filter) && f.kind == FilterKind::Safe)
+    }
 
-	return true;
+    fn list(&self, kind: FilterKind) {
+        let now = unix_now();
+        for (i, f) in self
+            .filters
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.kind == kind)
+        {
+            let expiry = if f.expires != 0.0 {
+                let mut left = (f.expires - now) as i64;
+                let days = left / 86_400;
+                left -= days * 86_400;
+                let hours = left / 3_600;
+                left -= hours * 3_600;
+                let minutes = left / 60;
+                let seconds = left - minutes * 60;
+                if days != 0 {
+                    format!("|{days:4}d:{hours:2}h")
+                } else if hours != 0 {
+                    format!("|{hours:4}h:{minutes:2}m")
+                } else {
+                    format!("|{minutes:4}m:{seconds:2}s")
+                }
+            } else {
+                "|permanent".to_owned()
+            };
+            cprint!("{i:3}|{}|{}{expiry}\n", padded_ip(f.ip()), f.kind.label());
+        }
+    }
 }
 
-static void SV_RemoveBansIPFilter (int i)
-{
-	for (; i + 1 < numipfilters; i++)
-		ipfilters[i] = ipfilters[i + 1];
+impl Proxy {
+    pub fn register_ban_commands(&mut self) {
+        self.cmds.register("addip", cmd_addip);
+        self.cmds.register("removeip", cmd_removeip);
+        self.cmds.register("listip", cmd_listip);
+        self.cmds.register("writeip", cmd_writeip);
+        self.cmds.register("banip", cmd_banip);
+        self.cmds.register("banremove", cmd_banremove);
+        self.cmds.register("banlist", cmd_banlist);
+    }
 
-	numipfilters--;
+    /// Loads the persisted ban list.
+    pub fn ban_init(&mut self) {
+        self.cmds
+            .cbuf
+            .insert_text(format!("exec {LISTIP_NAME}\n").as_bytes());
+        self.execute_buffer();
+    }
 }
 
-static void SV_Cmd_Banip_f(void)
-{
-	unsigned char	b[4];
-	double		d;
-	int			c, t;
-	ipfilter_t  f;
-	char		arg2[32], arg2c[sizeof(arg2)], tmp_str[256];
+fn cmd_addip(proxy: &mut Proxy, args: &Args) {
+    let Some((compare, mask)) = parse_filter(args.arg(1)).filter(|(c, _)| *c != [0; 4]) else {
+        cprint!("Bad filter address: {}\n", qstr(args.arg(1)));
+        return;
+    };
 
-	c = Cmd_Argc ();
-	if (c < 3)
-	{
-		Sys_Printf("usage: %s <ip> <time<s m h d>>\n", Cmd_Argv(0));
-		return;
-	}
+    let kind = match args.arg(2) {
+        b"" | b"ban" => FilterKind::Ban,
+        b"safe" => FilterKind::Safe,
+        other => {
+            cprint!("Wrong filter type {}, use ban or safe\n", qstr(other));
+            return;
+        }
+    };
 
-	if (!StringToFilter (Cmd_Argv(1), &f))
-	{
-		Sys_Printf("ban: bad ip address: %s\n", Cmd_Argv(1));
-		return;
-	}
+    // "+10" bans for ten seconds from now; a bare number is an absolute unix time.
+    let when = args.arg(3);
+    let (base, when) = match when.strip_prefix(b"+") {
+        Some(relative) => (unix_now(), relative),
+        None => (0.0, when),
+    };
+    let expires = parse::float_prefix(when).map_or(0.0, |t| t + base);
 
-	if (!SV_CanAddBan(&f))
-	{
-		Sys_Printf("ban: can't ban such ip: %s\n", Cmd_Argv(1));
-		return;
-	}
-
-	strlcpy(arg2, Cmd_Argv(2), sizeof(arg2));
-
-	// sscanf safe here since sizeof(arg2) == sizeof(arg2c), right?
-	if (sscanf(arg2, "%d%s", &t, arg2c) != 2 || strlen(arg2c) != 1)
-	{
-		Sys_Printf("ban: wrong time arg\n");
-		return;
-	}
-
-	d = t = bound(0, t, 999);
-	switch(arg2c[0])
-	{
-		case 's': break; // seconds is seconds
-		case 'm': d *= 60; break; // 60 seconds per minute
-		case 'h': d *= 60*60; break; // 3600 seconds per hour
-		case 'd': d *= 60*60*24; break; // 86400 seconds per day
-		default:
-		Sys_Printf("ban: wrong time arg\n");
-		return;
-	}
-
-	*(unsigned *)b = f.compare;
-	Sys_Printf("%3i.%3i.%3i.%3i was banned for %d%s\n", b[0], b[1], b[2], b[3], t, arg2c);
-
-	snprintf(tmp_str, sizeof(tmp_str), "addip %i.%i.%i.%i ban %s%.0lf\n", b[0], b[1], b[2], b[3], d ? "+" : "", d);
-	Cbuf_AddText(tmp_str);
-	Cbuf_AddText("writeip\n");
+    let filter = IpFilter {
+        compare,
+        mask,
+        expires,
+        kind,
+    };
+    let filters = &mut proxy.bans.filters;
+    match filters.iter().position(|f| f.same_rule(&filter)) {
+        Some(i) => filters[i] = filter,
+        None if filters.len() >= MAX_IPFILTERS => cprint!("IP filter list is full\n"),
+        None => filters.push(filter),
+    }
 }
 
-static void SV_Cmd_Banremove_f(void)
-{
-	unsigned char	b[4];
-	int		id;
-
-	if (Cmd_Argc () < 2)
-	{
-		Sys_Printf("usage: %s [banid]\n", Cmd_Argv(0));
-		SV_BanList_f();
-		return;
-	}
-
-	id = atoi(Cmd_Argv(1));
-
-	if (id < 0 || id >= numipfilters)
-	{
-		Sys_Printf("Wrong ban id: %d\n", id);
-		return;
-	}
-
-	if (ipfilters[id].type == ipft_safe)
-	{
-		Sys_Printf("Can't remove such ban with id: %d\n", id);
-		return;
-	}
-
-	*(unsigned *)b = ipfilters[id].compare;
-	Sys_Printf("%3i.%3i.%3i.%3i was unbanned\n", b[0], b[1], b[2], b[3]);
-
-	SV_RemoveBansIPFilter (id);
-	Cbuf_AddText("writeip\n");
+fn cmd_removeip(proxy: &mut Proxy, args: &Args) {
+    let Some((compare, mask)) = parse_filter(args.arg(1)) else {
+        cprint!("Bad filter address: {}\n", qstr(args.arg(1)));
+        return;
+    };
+    match proxy
+        .bans
+        .filters
+        .iter()
+        .position(|f| f.mask == mask && f.compare == compare)
+    {
+        Some(i) => {
+            proxy.bans.filters.remove(i);
+            cprint!("Removed.\n");
+        }
+        None => cprint!("Didn't find {}.\n", qstr(args.arg(1))),
+    }
 }
 
-void SV_CleanBansIPList (void)
-{
-	time_t	long_time = time(NULL);
-	int     i;
-
-	for (i = 0; i < numipfilters;)
-	{
-		if (ipfilters[i].time && ipfilters[i].time <= long_time)
-		{
-			SV_RemoveBansIPFilter (i);
-		}
-		else
-		{
-			i++;
-		}
-	}
+fn cmd_listip(proxy: &mut Proxy, _args: &Args) {
+    let now = unix_now();
+    cprint!("Filter list:\n");
+    for f in &proxy.bans.filters {
+        let expiry = if f.expires != 0.0 {
+            format!(" | {} s", (f.expires - now) as i64)
+        } else {
+            String::new()
+        };
+        cprint!("{} | {}{expiry}\n", padded_ip(f.ip()), f.kind.label());
+    }
 }
 
-void Ban_Init(void)
-{
-//	Cvar_Register(&filterban);
-
-	Cmd_AddCommand ("addip", SV_AddIP_f);
-	Cmd_AddCommand ("removeip", SV_RemoveIP_f);
-	Cmd_AddCommand ("listip", SV_ListIP_f);
-	Cmd_AddCommand ("writeip", SV_WriteIP_f);
-
-	Cmd_AddCommand("banip", SV_Cmd_Banip_f);
-	Cmd_AddCommand("banremove", SV_Cmd_Banremove_f);
-	Cmd_AddCommand("banlist", SV_BanList_f);
-
-	// now exec our banlist.cfg
-	Cbuf_InsertText ("exec " LISTIP_NAME "\n");
-	Cbuf_Execute();
+fn cmd_writeip(proxy: &mut Proxy, _args: &Args) {
+    cprint!("Writing {LISTIP_NAME}.\n");
+    let safe_first = |f: &&IpFilter| f.kind == FilterKind::Safe;
+    let contents: String = proxy
+        .bans
+        .filters
+        .iter()
+        .filter(safe_first)
+        .chain(proxy.bans.filters.iter().filter(|f| !safe_first(f)))
+        .map(|f| {
+            format!(
+                "addip {} {} {:.0}\n",
+                f.ip(),
+                f.kind.label().trim_start(),
+                f.expires
+            )
+        })
+        .collect();
+    if std::fs::write(LISTIP_NAME, contents).is_err() {
+        cprint!("Couldn't open {LISTIP_NAME}\n");
+    }
 }
 
+fn cmd_banip(proxy: &mut Proxy, args: &Args) {
+    if args.argc() < 3 {
+        cprint!("usage: {} <ip> <time<s m h d>>\n", args.arg_str(0));
+        return;
+    }
+    let Some((compare, mask)) = parse_filter(args.arg(1)) else {
+        cprint!("ban: bad ip address: {}\n", qstr(args.arg(1)));
+        return;
+    };
+    let filter = IpFilter {
+        compare,
+        mask,
+        expires: 0.0,
+        kind: FilterKind::Ban,
+    };
+    if !proxy.bans.can_add_ban(&filter) {
+        cprint!("ban: can't ban such ip: {}\n", qstr(args.arg(1)));
+        return;
+    }
+
+    let spec = args.arg(2);
+    let digits = spec
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(spec.len());
+    let (amount, unit) = spec.split_at(digits);
+    if amount.is_empty() || unit.len() != 1 {
+        cprint!("ban: wrong time arg\n");
+        return;
+    }
+    let amount = parse::atoi(amount).clamp(0, 999);
+    let multiplier = match unit[0] {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 60 * 60,
+        b'd' => 60 * 60 * 24,
+        _ => {
+            cprint!("ban: wrong time arg\n");
+            return;
+        }
+    };
+    let seconds = amount * multiplier;
+
+    cprint!(
+        "{} was banned for {amount}{}\n",
+        padded_ip(filter.ip()),
+        unit[0] as char
+    );
+    let plus = if seconds != 0 { "+" } else { "" };
+    proxy
+        .cmds
+        .cbuf
+        .add_text(format!("addip {} ban {plus}{seconds}\n", filter.ip()).as_bytes());
+    proxy.cmds.cbuf.add_text(b"writeip\n");
+}
+
+fn cmd_banremove(proxy: &mut Proxy, args: &Args) {
+    if args.argc() < 2 {
+        cprint!("usage: {} [banid]\n", args.arg_str(0));
+        cmd_banlist(proxy, args);
+        return;
+    }
+    let id = parse::atoi(args.arg(1));
+    let Some(filter) = usize::try_from(id)
+        .ok()
+        .and_then(|i| proxy.bans.filters.get(i))
+    else {
+        cprint!("Wrong ban id: {id}\n");
+        return;
+    };
+    if filter.kind == FilterKind::Safe {
+        cprint!("Can't remove such ban with id: {id}\n");
+        return;
+    }
+    cprint!("{} was unbanned\n", padded_ip(filter.ip()));
+    proxy.bans.filters.remove(id as usize);
+    proxy.cmds.cbuf.add_text(b"writeip\n");
+}
+
+fn cmd_banlist(proxy: &mut Proxy, _args: &Args) {
+    if proxy.bans.filters.is_empty() {
+        cprint!("Ban list: empty\n");
+        return;
+    }
+    cprint!(
+        "Ban list:\n{}\n{:>3}|{:>15}|{:>4}|{:>9}\n",
+        "-".repeat(35),
+        "id",
+        "ip mask",
+        "type",
+        "expire"
+    );
+    proxy.bans.list(FilterKind::Safe);
+    proxy.bans.list(FilterKind::Ban);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(ip: [u8; 4]) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::from(ip), 27500)
+    }
+
+    #[test]
+    fn parses_partial_filters() {
+        assert_eq!(
+            parse_filter(b"192.246.40"),
+            Some(([192, 246, 40, 0], [255, 255, 255, 0]))
+        );
+        assert_eq!(
+            parse_filter(b"10.0.0.1"),
+            Some(([10, 0, 0, 1], [255, 0, 0, 255]))
+        );
+        assert_eq!(parse_filter(b"x.1.1.1"), None);
+        assert_eq!(parse_filter(b""), None);
+    }
+
+    #[test]
+    fn bans_match_networks_and_expire() {
+        let mut proxy = Proxy::new_for_tests();
+        proxy.execute_line(b"addip 192.246.40");
+        proxy.execute_line(b"addip 10.1.1.1 safe");
+        proxy.execute_line(b"addip 10.2.2.2 ban +0.5");
+        assert!(proxy.bans.is_banned(addr([192, 246, 40, 7])));
+        assert!(!proxy.bans.is_banned(addr([192, 246, 41, 7])));
+        assert!(!proxy.bans.is_banned(addr([10, 1, 1, 1])));
+        assert!(proxy.bans.is_banned(addr([10, 2, 2, 2])));
+        assert_eq!(proxy.bans.filters.len(), 3);
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        proxy.bans.clean_expired();
+        assert!(!proxy.bans.is_banned(addr([10, 2, 2, 2])));
+        assert_eq!(proxy.bans.filters.len(), 2);
+
+        proxy.execute_line(b"removeip 192.246.40");
+        assert!(!proxy.bans.is_banned(addr([192, 246, 40, 7])));
+    }
+
+    #[test]
+    fn banip_respects_safe_list_and_queues_addip() {
+        let mut proxy = Proxy::new_for_tests();
+        proxy.execute_line(b"addip 10.1.1.1 safe");
+        proxy.execute_line(b"banip 10.1.1.1 10m");
+        assert!(proxy.cmds.cbuf.next_line().is_none());
+
+        proxy.execute_line(b"banip 10.3.3.3 2h");
+        assert_eq!(
+            proxy.cmds.cbuf.next_line().unwrap(),
+            b"addip 10.3.3.3 ban +7200"
+        );
+        assert_eq!(proxy.cmds.cbuf.next_line().unwrap(), b"writeip");
+
+        proxy.execute_line(b"banip 10.3.3.3 2x");
+        assert!(proxy.cmds.cbuf.next_line().is_none());
+    }
+}

@@ -1,865 +1,502 @@
-/*
-Q3Fusion - Quake III Clone Engine
+//! Adaptive Huffman coding used by the Quake III connectionless protocol.
+//!
+//! This is the algorithm from id's `huffman.c` (Vitter's adaptive scheme with
+//! a "not yet transmitted" escape symbol), rebuilt over an index arena. Every
+//! quirk of the original update order is preserved on purpose: both ends of a
+//! connection must evolve identical trees or the stream becomes garbage.
 
-Copyright (C) 2003 Andrey Nazarov
+const NYT: u16 = 256;
+const INTERNAL_NODE: u16 = 257;
+const MAX_NODES: usize = 768;
 
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
+type NodeId = usize;
+type CellId = usize;
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  
-
-See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
-*/
-
-//
-// huff.c - Huffman compression routines for data bitstream
-//
-#include "qwfwd.h"
-
-#define MAX_HUFF_BUF_SIZE ( MSG_BUF_SIZE + 64 ) // have no idea about which size it should be
-
-#define ID_INLINE
-
-#define VALUE(a)			(*(intptr_t *)&(a))
-#define NODE(a)				((void*)(a))
-
-#define NODE_START			NODE(  1)
-#define NODE_NONE			NODE(256)
-#define NODE_NEXT			NODE(257)
-
-#define NOT_REFERENCED		256
-
-#define HUFF_TREE_SIZE		7175
-typedef void				*tree_t[HUFF_TREE_SIZE];
-
-//
-// pre-defined frequency counts for all bytes [0..255]
-//
-static int q3huffCounts[256] = {
-	0x3D1CB, 0x0A0E9, 0x01894, 0x01BC2, 0x00E92, 0x00EA6, 0x017DE, 0x05AF3,
-	0x08225, 0x01B26, 0x01E9E, 0x025F2, 0x02429, 0x0436B, 0x00F6D, 0x006F2,
-	0x02060, 0x00644, 0x00636, 0x0067F, 0x0044C, 0x004BD, 0x004D6, 0x0046E,
-	0x006D5, 0x00423, 0x004DE, 0x0047D, 0x004F9, 0x01186, 0x00AF5, 0x00D90,
-	0x0553B, 0x00487, 0x00686, 0x0042A, 0x00413, 0x003F4, 0x0041D, 0x0042E,
-	0x006BE, 0x00378, 0x0049C, 0x00352, 0x003C0, 0x0030C, 0x006D8, 0x00CE0,
-	0x02986, 0x011A2, 0x016F9, 0x00A7D, 0x0122A, 0x00EFD, 0x0082D, 0x0074B,
-	0x00A18, 0x0079D, 0x007B4, 0x003AC, 0x0046E, 0x006FC, 0x00686, 0x004B6,
-	0x01657, 0x017F0, 0x01C36, 0x019FE, 0x00E7E, 0x00ED3, 0x005D4, 0x005F4,
-	0x008A7, 0x00474, 0x0054B, 0x003CB, 0x00884, 0x004E0, 0x00530, 0x004AB,
-	0x006EA, 0x00436, 0x004F0, 0x004F2, 0x00490, 0x003C5, 0x00483, 0x004A2,
-	0x00543, 0x004CC, 0x005F9, 0x00640, 0x00A39, 0x00800, 0x009F2, 0x00CCB,
-	0x0096A, 0x00E01, 0x009C8, 0x00AF0, 0x00A73, 0x01802, 0x00E4F, 0x00B18,
-	0x037AD, 0x00C5C, 0x008AD, 0x00697, 0x00C88, 0x00AB3, 0x00DB8, 0x012BC,
-	0x00FFB, 0x00DBB, 0x014A8, 0x00FB0, 0x01F01, 0x0178F, 0x014F0, 0x00F54,
-	0x0131C, 0x00E9F, 0x011D6, 0x012C7, 0x016DC, 0x01900, 0x01851, 0x02063,
-	0x05ACB, 0x01E9E, 0x01BA1, 0x022E7, 0x0153D, 0x01183, 0x00E39, 0x01488,
-	0x014C0, 0x014D0, 0x014FA, 0x00DA4, 0x0099A, 0x0069E, 0x0071D, 0x00849,
-	0x0077C, 0x0047D, 0x005EC, 0x00557, 0x004D4, 0x00405, 0x004EA, 0x00450,
-	0x004DD, 0x003EE, 0x0047D, 0x00401, 0x004D9, 0x003B8, 0x00507, 0x003E5,
-	0x006B1, 0x003F1, 0x004A3, 0x0036F, 0x0044B, 0x003A1, 0x00436, 0x003B7,
-	0x00678, 0x003A2, 0x00481, 0x00406, 0x004EE, 0x00426, 0x004BE, 0x00424,
-	0x00655, 0x003A2, 0x00452, 0x00390, 0x0040A, 0x0037C, 0x00486, 0x003DE,
-	0x00497, 0x00352, 0x00461, 0x00387, 0x0043F, 0x00398, 0x00478, 0x00420,
-	0x00D86, 0x008C0, 0x0112D, 0x02F68, 0x01E4E, 0x00541, 0x0051B, 0x00CCE,
-	0x0079E, 0x00376, 0x003FF, 0x00458, 0x00435, 0x00412, 0x00425, 0x0042F,
-	0x005CC, 0x003E9, 0x00448, 0x00393, 0x0041C, 0x003E3, 0x0042E, 0x0036C,
-	0x00457, 0x00353, 0x00423, 0x00325, 0x00458, 0x0039B, 0x0044F, 0x00331,
-	0x0076B, 0x00750, 0x003D0, 0x00349, 0x00467, 0x003BC, 0x00487, 0x003B6,
-	0x01E6F, 0x003BA, 0x00509, 0x003A5, 0x00467, 0x00C87, 0x003FC, 0x0039F,
-	0x0054B, 0x00300, 0x00410, 0x002E9, 0x003B8, 0x00325, 0x00431, 0x002E4,
-	0x003F5, 0x00325, 0x003F0, 0x0031C, 0x003E4, 0x00421, 0x02CC1, 0x034C0
-};
-
-static int countinghuffCounts[256];
-
-
-//
-// static Huffman tree
-//
-static tree_t	huffTree;
-
-//
-// received from MSG_* code
-//
-static int		huffBitPos;
-
-
-/*
-=======================================================================================
-
-  HUFFMAN TREE CONSTRUCTION
-
-=======================================================================================
-*/
-
-/*
-============
-Huff_PrepareTree
-============
-*/
-static ID_INLINE void Huff_PrepareTree(tree_t tree)
-{
-	void **node;
-	
-	memset(tree, 0, sizeof(tree_t));
-	
-	// create first node
-	node = &tree[263];
-	tree[0] = (void*)(VALUE(tree[0])+1);
-
-	node[7] = NODE_NONE;
-	tree[2] = node;
-	tree[3] = node;
-	tree[4] = node;
-	tree[261] = node;
+#[derive(Clone, Copy, Default)]
+struct Node {
+    left: Option<NodeId>,
+    right: Option<NodeId>,
+    parent: Option<NodeId>,
+    next: Option<NodeId>,
+    prev: Option<NodeId>,
+    /// Shared cell naming the highest ranked node of this node's weight block.
+    head: Option<CellId>,
+    weight: u32,
+    symbol: u16,
 }
 
-
-
-/*
-============
-Huff_GetNode
-============
-*/
-static ID_INLINE void **Huff_GetNode(void **tree)
-{
-	void **node;
-	int	value;
-
-	node = (void**)tree[262];
-	if (!node)
-	{
-		value = VALUE(tree[1])++;
-		node = &tree[value + 6407];
-		return node;
-	}
-
-	tree[262] = node[0];
-	return node;
+struct Tree {
+    nodes: Vec<Node>,
+    cells: Vec<Option<NodeId>>,
+    free_cells: Vec<CellId>,
+    root: NodeId,
+    /// Lowest ranked node of the list, which is always the NYT node.
+    lhead: NodeId,
+    loc: [Option<NodeId>; 257],
 }
 
-/*
-============
-Huff_Swap
-============
-*/
-static ID_INLINE void Huff_Swap(void **tree1, void **tree2, void **tree3)
-{
-	void **a, **b;
+impl Tree {
+    fn new() -> Self {
+        let mut tree = Tree {
+            nodes: Vec::with_capacity(MAX_NODES),
+            cells: Vec::with_capacity(MAX_NODES),
+            free_cells: Vec::new(),
+            root: 0,
+            lhead: 0,
+            loc: [None; 257],
+        };
+        tree.nodes.push(Node {
+            symbol: NYT,
+            ..Node::default()
+        });
+        tree.loc[NYT as usize] = Some(0);
+        tree
+    }
 
-	a = (void**)tree2[2];
-	if (a)
-	{
-		if (a[0] == tree2)
-			a[0] = tree3;
-		else
-			a[1] = tree3;
-	}
-	else
-		tree1[2] = tree3;
+    fn alloc_node(&mut self) -> NodeId {
+        self.nodes.push(Node::default());
+        self.nodes.len() - 1
+    }
 
-	b = (void**)tree3[2];
+    fn alloc_cell(&mut self) -> CellId {
+        self.free_cells.pop().unwrap_or_else(|| {
+            self.cells.push(None);
+            self.cells.len() - 1
+        })
+    }
 
-	if (b)
-	{
-		if (b[0] == tree3)
-		{
-			b[0] = tree2;
-			tree2[2] = b;
-			tree3[2] = a;
-			return;
-		}
+    fn release_cell(&mut self, cell: CellId) {
+        self.cells[cell] = None;
+        self.free_cells.push(cell);
+    }
 
-		b[1] = tree2;
-		tree2[2] = b;
-		tree3[2] = a;
-		return;
-	}
+    fn head_of(&self, node: NodeId) -> CellId {
+        self.nodes[node]
+            .head
+            .expect("ranked node always belongs to a weight block")
+    }
 
-	tree1[2] = tree2;
-	tree2[2] = NULL;
-	tree3[2] = a;
+    fn replace_child(&mut self, parent: Option<NodeId>, old: NodeId, new: NodeId) {
+        match parent {
+            Some(p) if self.nodes[p].left == Some(old) => self.nodes[p].left = Some(new),
+            Some(p) => self.nodes[p].right = Some(new),
+            None => self.root = new,
+        }
+    }
+
+    // The two child replacements happen in sequence, so swapping siblings can
+    // undo itself; that is what the reference implementation does too.
+    fn swap_in_tree(&mut self, a: NodeId, b: NodeId) {
+        let parent_a = self.nodes[a].parent;
+        let parent_b = self.nodes[b].parent;
+        self.replace_child(parent_a, a, b);
+        self.replace_child(parent_b, b, a);
+        self.nodes[a].parent = parent_b;
+        self.nodes[b].parent = parent_a;
+    }
+
+    fn swap_in_list(&mut self, a: NodeId, b: NodeId) {
+        let (a_next, a_prev) = (self.nodes[a].next, self.nodes[a].prev);
+        let (b_next, b_prev) = (self.nodes[b].next, self.nodes[b].prev);
+        self.nodes[a].next = b_next;
+        self.nodes[b].next = a_next;
+        self.nodes[a].prev = b_prev;
+        self.nodes[b].prev = a_prev;
+
+        if self.nodes[a].next == Some(a) {
+            self.nodes[a].next = Some(b);
+        }
+        if self.nodes[b].next == Some(b) {
+            self.nodes[b].next = Some(a);
+        }
+        if let Some(n) = self.nodes[a].next {
+            self.nodes[n].prev = Some(a);
+        }
+        if let Some(n) = self.nodes[b].next {
+            self.nodes[n].prev = Some(b);
+        }
+        if let Some(n) = self.nodes[a].prev {
+            self.nodes[n].next = Some(a);
+        }
+        if let Some(n) = self.nodes[b].prev {
+            self.nodes[n].next = Some(b);
+        }
+    }
+
+    fn increment(&mut self, node: NodeId) {
+        let weight = self.nodes[node].weight;
+
+        if let Some(next) = self.nodes[node].next
+            && self.nodes[next].weight == weight
+        {
+            let leader = self.cells[self.head_of(node)].expect("weight block has a leader");
+            if Some(leader) != self.nodes[node].parent {
+                self.swap_in_tree(leader, node);
+            }
+            self.swap_in_list(leader, node);
+        }
+
+        let head = self.head_of(node);
+        match self.nodes[node].prev {
+            Some(prev) if self.nodes[prev].weight == weight => self.cells[head] = Some(prev),
+            _ => self.release_cell(head),
+        }
+
+        let weight = weight + 1;
+        self.nodes[node].weight = weight;
+        match self.nodes[node].next {
+            Some(next) if self.nodes[next].weight == weight => {
+                self.nodes[node].head = self.nodes[next].head;
+            }
+            _ => {
+                let cell = self.alloc_cell();
+                self.cells[cell] = Some(node);
+                self.nodes[node].head = Some(cell);
+            }
+        }
+
+        if let Some(parent) = self.nodes[node].parent {
+            self.increment(parent);
+            if self.nodes[node].prev == Some(parent) {
+                self.swap_in_list(node, parent);
+                let head = self.head_of(node);
+                if self.cells[head] == Some(node) {
+                    self.cells[head] = Some(parent);
+                }
+            }
+        }
+    }
+
+    /// Inserts `node` right above the NYT node in the rank list, joining the
+    /// weight-1 block if one is already there.
+    fn link_above_nyt(&mut self, node: NodeId, fallback_leader: NodeId) {
+        let lhead = self.lhead;
+        let above = self.nodes[lhead].next;
+        self.nodes[node].next = above;
+        match above {
+            Some(a) => {
+                self.nodes[a].prev = Some(node);
+                if self.nodes[a].weight == 1 {
+                    self.nodes[node].head = self.nodes[a].head;
+                } else {
+                    let cell = self.alloc_cell();
+                    self.cells[cell] = Some(fallback_leader);
+                    self.nodes[node].head = Some(cell);
+                }
+            }
+            None => {
+                let cell = self.alloc_cell();
+                self.cells[cell] = Some(node);
+                self.nodes[node].head = Some(cell);
+            }
+        }
+        self.nodes[lhead].next = Some(node);
+        self.nodes[node].prev = Some(lhead);
+    }
+
+    /// Counts one more occurrence of `ch`, growing the tree on first sight.
+    fn add_ref(&mut self, ch: u8) {
+        if let Some(node) = self.loc[ch as usize] {
+            self.increment(node);
+            return;
+        }
+
+        let lhead = self.lhead;
+        let leaf = self.alloc_node();
+        let branch = self.alloc_node();
+
+        self.nodes[branch].symbol = INTERNAL_NODE;
+        self.nodes[branch].weight = 1;
+        self.link_above_nyt(branch, branch);
+
+        self.nodes[leaf].symbol = u16::from(ch);
+        self.nodes[leaf].weight = 1;
+        self.link_above_nyt(leaf, branch);
+
+        let parent = self.nodes[lhead].parent;
+        self.replace_child(parent, lhead, branch);
+        self.nodes[branch].right = Some(leaf);
+        self.nodes[branch].left = Some(lhead);
+        self.nodes[branch].parent = parent;
+        self.nodes[lhead].parent = Some(branch);
+        self.nodes[leaf].parent = Some(branch);
+        self.loc[ch as usize] = Some(leaf);
+
+        if let Some(p) = parent {
+            self.increment(p);
+        }
+    }
+
+    fn emit_path(&self, node: NodeId, child: Option<NodeId>, out: &mut BitWriter) {
+        if let Some(parent) = self.nodes[node].parent {
+            self.emit_path(parent, Some(node), out);
+        }
+        if let Some(child) = child {
+            out.put(u8::from(self.nodes[node].right == Some(child)));
+        }
+    }
+
+    fn transmit(&self, symbol: u16, out: &mut BitWriter) {
+        match self.loc[symbol as usize] {
+            Some(node) => self.emit_path(node, None, out),
+            None => {
+                self.transmit(NYT, out);
+                for i in (0..8).rev() {
+                    out.put(((symbol >> i) & 1) as u8);
+                }
+            }
+        }
+    }
+
+    fn receive(&self, input: &mut BitReader) -> u16 {
+        let mut node = Some(self.root);
+        while let Some(n) = node
+            && self.nodes[n].symbol == INTERNAL_NODE
+        {
+            node = if input.get() == 1 {
+                self.nodes[n].right
+            } else {
+                self.nodes[n].left
+            };
+        }
+        node.map_or(0, |n| self.nodes[n].symbol)
+    }
 }
 
-/*
-============
-Huff_SwapTrees
-============
-*/
-static ID_INLINE void Huff_SwapTrees(void **tree1, void **tree2)
-{
-	void **temp;
-
-	temp = (void**)tree1[3];
-	tree1[3] = tree2[3];
-	tree2[3] = temp;
-
-	temp = (void**)tree1[4];
-	tree1[4] = tree2[4];
-	tree2[4] = temp;
-
-	if (tree1[3] == tree1)
-		tree1[3] = tree2;
-
-	if (tree2[3] == tree2)
-		tree2[3] = tree1;
-
-	temp = (void**)tree1[3];
-	if (temp)
-		temp[4] = tree1;
-
-	temp = (void**)tree2[3];
-	if (temp)
-		temp[4] = tree2;
-
-	temp = (void**)tree1[4];
-	if (temp)
-		temp[3] = tree1;
-
-	temp = (void**)tree2[4];
-	if (temp)
-		temp[3] = tree2;
-
+struct BitWriter {
+    buf: Vec<u8>,
+    pos: usize,
 }
 
-/*
-============
-Huff_DeleteNode
-============
-*/
-static ID_INLINE void Huff_DeleteNode(void **tree1, void **tree2)
-{
-	tree2[0] = tree1[262];
-	tree1[262] = tree2;
+impl BitWriter {
+    fn put(&mut self, bit: u8) {
+        if self.pos & 7 == 0 {
+            self.buf.push(0);
+        }
+        let index = self.pos >> 3;
+        self.buf[index] |= bit << (self.pos & 7);
+        self.pos += 1;
+    }
 }
 
-/*
-============
-Huff_IncrementFreq_r
-============
-*/
-static void Huff_IncrementFreq_r(void **tree1, void **tree2)
-{
-	void **a, **b;
-
-	if (!tree2)
-	{
-		return;
-	}
-
-	a = (void**)tree2[3];
-	if (a)
-	{
-		a = (void**)a[6];
-		if (a == tree2[6])
-		{
-			b = (void**)tree2[5];
-			if (b[0] != tree2[2])
-			{
-				Huff_Swap(tree1, (void**)b[0], tree2);
-			}
-			Huff_SwapTrees((void**)b[0], tree2);
-		}
-	}
-
-	a = (void**)tree2[4];
-	if (a && a[6] == tree2[6])
-	{
-		b = (void**)tree2[5];
-		b[0] = a;
-	}
-	else
-	{
-		a = (void**)tree2[5];
-		a[0] = 0;
-		Huff_DeleteNode(tree1, (void**)tree2[5]);
-	}
-
-	
-	VALUE(tree2[6])++;
-	a = (void**)tree2[3];
-	if (a && a[6] == tree2[6])
-	{
-		tree2[5] = a[5];
-	}
-	else
-	{
-		a = Huff_GetNode(tree1);
-		tree2[5] = a;
-		a[0] = tree2;
-	}
-
-	if (tree2[2])
-	{
-		Huff_IncrementFreq_r(tree1, (void**)tree2[2]);
-	
-		if (tree2[4] == tree2[2])
-		{
-			Huff_SwapTrees(tree2, (void**)tree2[2]);
-			a = (void**)tree2[5];
-
-			if (a[0] == tree2)
-			{
-				a[0] = (void**)tree2[2];
-			}
-		}
-	}
+struct BitReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
 }
 
-/*
-============
-Huff_AddReference
-
-Insert 'ch' into the tree or increment it's frequency
-============
-*/
-static void Huff_AddReference(void **tree, intptr_t ch)
-{
-	void **a, **b, **c, **d;
-	int value;
-
-	ch &= 255;
-	if (tree[ch + 5])
-	{
-		Huff_IncrementFreq_r(tree, (void**)tree[ch + 5]);
-		return; // already added
-	}
-
-	value = VALUE(tree[0])++;
-	b = &tree[value * 8 + 263];
-
-	value = VALUE(tree[0])++;
-	a = &tree[value * 8 + 263];
-
-	a[7] = NODE_NEXT;
-	a[6] = NODE_START;
-	d = (void**)tree[3];
-	a[3] = d[3];
-	if (a[3])
-	{
-		d = (void**)a[3];
-		d[4] = a;
-		d = (void**)a[3];
-		if (d[6] == NODE_START)
-		{
-			a[5] = d[5];
-		}
-		else
-		{
-			d = Huff_GetNode(tree);
-			a[5] = d;
-			d[0] = a;
-		}
-	}
-	else
-	{
-		d = Huff_GetNode(tree);
-		a[5] = d;
-		d[0] = a;
-
-	}
-	
-	d = (void**)tree[3];
-	d[3] = a;
-	a[4] = (void**)tree[3];
-	b[7] = NODE(ch);
-	b[6] = NODE_START;
-	d = (void**)tree[3];
-	b[3] = d[3];
-	if (b[3])
-	{
-		d = (void**)b[3];
-		d[4] = b;
-		if (d[6] == NODE_START)
-		{
-			b[5] = d[5];
-		}
-		else
-		{
-			d = Huff_GetNode(tree);
-			b[5] = d;
-			d[0] = a;
-		}
-	}
-	else
-	{
-		d = Huff_GetNode(tree);
-		b[5] = d;
-		d[0] = b;
-	}
-
-	d = (void**)tree[3];
-	d[3] = b;
-	b[4] = (void**)tree[3];
-	b[1] = NULL;
-	b[0] = NULL;
-	d = (void**)tree[3];
-	c = (void**)d[2];
-	if (c)
-	{
-		if (c[0] == tree[3])
-		{
-			c[0] = a;
-		}
-		else
-		{
-			c[1] = a;
-		}
-	}
-	else
-	{
-		tree[2] = a;
-	}
-
-	a[1] = b;
-	d = (void**)tree[3];
-	a[0] = d;
-	a[2] = d[2];
-	b[2] = a;
-	d = (void**)tree[3];
-	d[2] = a;
-	tree[ch + 5] = b;
-
-	Huff_IncrementFreq_r(tree, (void**)a[2]);
+impl BitReader<'_> {
+    fn get(&mut self) -> u8 {
+        let bit = self
+            .buf
+            .get(self.pos >> 3)
+            .map_or(0, |&b| (b >> (self.pos & 7)) & 1);
+        self.pos += 1;
+        bit
+    }
 }
 
-/*
-=======================================================================================
+/// Compresses `msg[offset..]` in place, prefixing the two byte big-endian
+/// uncompressed length Q3 expects.
+pub fn compress(msg: &mut Vec<u8>, offset: usize) {
+    let Some(input) = msg.get(offset..) else {
+        return;
+    };
+    if input.is_empty() {
+        return;
+    }
 
-  BITSTREAM I/O
+    let mut out = BitWriter {
+        buf: vec![(input.len() >> 8) as u8, input.len() as u8],
+        pos: 16,
+    };
+    let mut tree = Tree::new();
+    for &b in input {
+        tree.transmit(u16::from(b), &mut out);
+        tree.add_ref(b);
+    }
 
-=======================================================================================
-*/
-
-/*
-============
-Huff_EmitBit
-
-Put one bit into buffer
-============
-*/
-static ID_INLINE void Huff_EmitBit(int bit, byte *buffer)
-{
-	if (!(huffBitPos & 7))
-	{
-		buffer[huffBitPos >> 3] = 0;
-	}
-
-	buffer[huffBitPos >> 3] |= bit << (huffBitPos & 7);
-	huffBitPos++;
+    let out_len = (out.pos >> 3) + 1;
+    out.buf.resize(out_len, 0);
+    msg.truncate(offset);
+    msg.extend_from_slice(&out.buf);
 }
 
-/*
-============
-Huff_GetBit
+/// Decompresses `msg[offset..]` in place, never growing the message past `max_size`.
+pub fn decompress(msg: &mut Vec<u8>, offset: usize, max_size: usize) {
+    let Some(input) = msg.get(offset..) else {
+        return;
+    };
+    if input.is_empty() {
+        return;
+    }
 
-Read one bit from buffer
-============
-*/
-static ID_INLINE int Huff_GetBit(byte *buffer)
-{
-	int bit;
+    let declared = (usize::from(input[0]) << 8) + usize::from(input.get(1).copied().unwrap_or(0));
+    let out_len = declared.min(max_size.saturating_sub(offset));
+    let mut reader = BitReader {
+        buf: input,
+        pos: 16,
+    };
+    let mut tree = Tree::new();
+    let mut out = Vec::with_capacity(out_len);
 
-	bit = buffer[huffBitPos >> 3] >> (huffBitPos & 7);
-	huffBitPos++;
+    for _ in 0..out_len {
+        if (reader.pos >> 3) > input.len() {
+            out.push(0);
+            break;
+        }
+        let mut symbol = tree.receive(&mut reader);
+        if symbol == NYT {
+            symbol = 0;
+            for _ in 0..8 {
+                symbol = (symbol << 1) | u16::from(reader.get());
+            }
+        }
+        out.push(symbol as u8);
+        tree.add_ref(symbol as u8);
+    }
+    out.resize(out_len, 0);
 
-	return (bit & 1);
+    msg.truncate(offset);
+    msg.extend_from_slice(&out);
 }
 
-/*
-============
-Huff_EmitPathToByte
-============
-*/
-static ID_INLINE void Huff_EmitPathToByte(void **tree, void **subtree, byte *buffer)
-{
-	if (tree[2])
-	{
-		Huff_EmitPathToByte((void**)tree[2], tree, buffer);
-	}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-	if (!subtree)
-	{
-		return;
-	}
+    fn roundtrip(payload: &[u8]) {
+        let header = b"\xff\xff\xff\xffconnect ";
+        let mut msg = header.to_vec();
+        msg.extend_from_slice(payload);
+        compress(&mut msg, header.len());
+        assert_eq!(&msg[..header.len()], header);
+        decompress(&mut msg, header.len(), 8192);
+        assert_eq!(&msg[header.len()..], payload);
+    }
 
-	//
-	// emit tree walking control bits
-	//
-	if (tree[1] == subtree)
-	{
-		Huff_EmitBit(1, buffer);
-	}
-	else
-	{
-		Huff_EmitBit(0, buffer);
-	}
+    #[test]
+    fn roundtrips_various_payloads() {
+        roundtrip(b"a");
+        roundtrip(b"\"\\name\\player\\challenge\\12345\\prx\\host\"\0");
+        roundtrip(&(0..=255u8).collect::<Vec<_>>());
+        roundtrip(&vec![0x41; 3000]);
+        let pseudo: Vec<u8> = (0..4000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        roundtrip(&pseudo);
+    }
+
+    #[test]
+    fn matches_reference_c_implementation() {
+        // Expected bytes were produced by the original huff.c (Huff_EncryptPacket at offset 12).
+        fn check(payload: &[u8], expected_hex: &[&str]) {
+            let expected: Vec<u8> = expected_hex
+                .concat()
+                .as_bytes()
+                .chunks(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            let mut msg = b"\xff\xff\xff\xffconnect ".to_vec();
+            msg.extend_from_slice(payload);
+            compress(&mut msg, 12);
+            assert_eq!(
+                msg[12..],
+                expected[..],
+                "compressed bytes differ from huff.c"
+            );
+            decompress(&mut msg, 12, 8192);
+            assert_eq!(&msg[12..], payload);
+        }
+
+        check(b"a", &["00018600"]);
+        check(
+            b"\"\\name\\player\\challenge\\12345\\prx\\host\"\0",
+            &[
+                "00284474b08b216cc79470001b1c4f16278cb1b0582340cce38351610a98191683b52e281e0f843de0dc71210f00",
+            ],
+        );
+        check(
+            &(0..=255u8).collect::<Vec<_>>(),
+            &[
+                "01000000010a30400634c0041c200ee4802ad001c6c00a38020f101ec40369411e501ad4022d410f301c4c034bc11670",
+                "185c020fc107083e840fa20bf1816443ba209b900f283a940daa0a758126439ba08bd007183c8c0e260bb38145c3aa60",
+                "93b00b38389c0c2e0a378107c38be083f003047e043f845e841f446e442fc44ec40f24762437a456a41764666427e446",
+                "e407147a143b945a941b546a542bd44ad40b34723433b452b41374627423f442f4030c7c0c3d8c5c8c1d4c6c4c2dcc4c",
+                "cc0d2c742c35ac54ac156c646c25ec44ec051c781c399c589c195c685c29dc48dc093c703c31bc50bc117c607c21fc40",
+                "fc0102fe04fe08fa12fc21e44de88bb027e10f22ee44de88ba127d21e64cec89b823f10712f624ee48da92bc21654dea",
+                "8ab425e90b32e664cec89a923d21674cee88bc21f9030afa14f628ea52dca1a44d698bb226e50d2aea54d6a8aa525da1",
+                "a64c6d89ba22f5051af234e668cad29ca1254d6b8ab624ed093ae274c6e88ad21da1274c6f88be20fd0106fc0cfa18f2",
+                "32ec61c4cda88b3127e30e26ec4cda98b2326d61c6ccac893923f30616f42cea58d2b2ac6145cdaa8a3525eb0a36e46c",
+                "cad892b22d6147ccae883d21fb020ef81cf238e272cce184cd298b3326e70c2ee85cd2b8a2724de186cc2d893b22f704",
+                "1ef03ce278c2f28ce105cd2b8a3724ef083ee07cc2f882f20de107cc2f883f20ff00",
+            ],
+        );
+        check(
+            &[0x41; 300],
+            &["012c82ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff07"],
+        );
+        let pseudo: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        check(
+            &pseudo,
+            &[
+                "03e800ba710f33eea73acc8408f64ed6502b8861d6440a5102087a1e8f836579186a1af38238d90fb21d7503499913a2",
+                "18310208e9053c3fac8fc74bedc16243b23898e40c343ac88df94a74413c039ce88b7805d83c4f8e3a8ba5815473a8c8",
+                "95680a50380b8c188a040104d38ff086b0039e7fea3fac5ec81e8e6ef22eb44ed00e167762372457401706677c263846",
+                "5e061a7a6c3ac85b8e1bf26bb42bd04b960ae272a432c05286127c6338235e431a036c7d283c4e5c0a1c746c302c964d",
+                "e20da475c0358655fc14b864de249a44ec0428794e390a597419306956281248640820704630fc51b811de619a21ec41",
+                "a800cefe14fdd0fb82f561f54de20bd927900f46ef04dce0b9f271a1e58cc3099a23e7078af7e8efc0deb2be21698ddc",
+                "0aa825630b82e6f0cef89cd23ac1710ced888b2125030cfae0f4d8e892dc41be0d748bf126c10df8ea7cd568abe25481",
+                "aecc6589d222860570f36ce648c9a2900126cd448a9024fc09bee3b4c7708e421fe12a4c5908a3207801b6fca4fa50f4",
+                "02eb61d24da80b01273f0e3aecb8d860b0726da1dc8cb1097c23db06d2f428e980d332a5214c8d908a5f259d0a5ce530",
+                "cab8955221c1440c81881d21190294f9c0f398e612ce4198cd1f8b2e266e0c98e8dcd1a8a4624a8190cc2e894c222a04",
+                "10f0cce088c02282e1dfaf8f6f0f4d951ededd1c0cd5383b393ab9b7b3b5b1bcb2b430b73a35313632b4b9b3babab6ad",
+                "a5a9a1aea6aaa2aca4a8202f272b232d2529212e262a222c3ebc38b9b13031beb62120a841464244230c88011111f563",
+                "ddd250535154909391121713111210e7e1e260536262a0a391a020232122c0c3c1c24043414280832186a14706634767",
+                "a02441e1a6c686c624e1e4d0af0b6a0e032f2b5fd6a4b8a8b03c0894e3e233f225340288484b4e4380008f8d0c6b0493",
+                "0e868c080f0b0d098e980c0c1d1d050e9a045f97114423a83c70910901f1d010b061316190b190787046900e67441736",
+                "6ea8c880ba30928e8581e30166049b115d887060d874816103038309048b4222e0c05008183412f0fff7fbf3fdf5f9f1",
+                "fef6faf2fcf4f8707f777b737d7579717e767ac2e8e8f060bfdfeecef6d6818df5b5d5d5e5a5c585a5b9d999e9d9c989",
+                "f1b189fec34383035dfb7a7bba7d7776b4b7b5b634373536d4d7d5d6545755569497959614171516e4e7e5e6cdcecacc",
+                "c89c969a92ec2c31213e2e2e263a2a323a3c2c34242c2830c03fd0a38fb797a77377375717b64e8e0ef676b636d65696",
+                "16e666a626c6468606fa7aba3ada5e3435d4d5d4aa282b29ea92979395519292941097111511161217e0e7e315e2e6e2",
+                "e4e065cccac2cc4493819e8e96466a2a4a0a72325212622242027c3c5c1c6c2c4c0c74fe8371366839c15e1851f90fc6",
+                "f1cd09f6e2ef1bc7cf09d6e5ef1bc7670bd6e5ef3bc0670bd6e547e90bc66743d6e5ef0b46c267d3e5ef0bc667d3e5ef",
+                "0bc667d3e5ef0bc66743e4ef0b464260e3674385e767e387e7e7e7e7c7c7c7c7c70f0e0e0e0e6663636363e3e7e7e7e7",
+                "e787e3e7e7e787cdcecacc80494f4b4d494e4a4c888f8b8d898e8a8c080f0b0d810e0a0c8085f2f3f58183f4f4708772",
+                "7571767271b0b7b3b5b5b6b2b4b03233353136863034d0d703d7d1d6d204d35057535551565254909793959196929410",
+                "1713151116121400e5e3e50105e1e2e400f9cbcac2fc9791819e8e81869a8a92869c8c94849c88f0ef8f0888e0f7e7fb",
+                "3dded7e7c7b76faf2fcf4f8f0ff77700",
+            ],
+        );
+        let mix: Vec<u8> = (0..64)
+            .map(|i| b"abcabcabdabeabfaaaaaaabbbbbbccccccccc"[i % 37])
+            .collect();
+        check(
+            &mix,
+            &["0040868c30761d1387a9831950fd93b6ed3dcfc3f1d11faa06"],
+        );
+    }
+
+    #[test]
+    fn empty_payload_is_untouched() {
+        let mut msg = b"\xff\xff\xff\xff".to_vec();
+        compress(&mut msg, 4);
+        assert_eq!(msg, b"\xff\xff\xff\xff");
+        decompress(&mut msg, 4, 8192);
+        assert_eq!(msg, b"\xff\xff\xff\xff");
+        compress(&mut msg, 10);
+        assert_eq!(msg, b"\xff\xff\xff\xff");
+    }
+
+    #[test]
+    fn truncated_input_does_not_panic() {
+        let mut msg = vec![0x00, 0x40];
+        decompress(&mut msg, 0, 8192);
+        assert_eq!(msg.len(), 0x40);
+        let mut msg = vec![0xff, 0xff, 0x12];
+        decompress(&mut msg, 0, 64);
+        assert_eq!(msg.len(), 64);
+    }
 }
-
-/*
-============
-Huff_GetByteFromTree
-
-Get one byte using dynamic or static tree
-============
-*/
-static ID_INLINE int Huff_GetByteFromTree(void **tree, byte *buffer)
-{
-	if (!tree)
-	{
-		return 0;
-	}
-
-	//
-	// walk through the tree until we get a value
-	//
-	while (tree[7] == NODE_NEXT)
-	{
-		if (!Huff_GetBit(buffer))
-		{
-			tree = (void**)tree[0];
-		}
-		else
-		{
-			tree = (void**)tree[1];
-		}
-
-		if (!tree)
-		{
-			return 0;
-		}
-	}
-
-	return VALUE(tree[7]);
-}
-
-/*
-============
-Huff_EmitByteDynamic
-
-Emit one byte using dynamic tree
-============
-*/
-static void Huff_EmitByteDynamic(void **tree, int value, byte *buffer)
-{
-	void **subtree;
-	int i;
-
-	//
-	// if byte was already referenced, emit path to it
-	//
-	subtree = (void**)tree[value + 5];
-	if (subtree)
-	{
-		if (subtree[2])
-		{
-			Huff_EmitPathToByte((void**)subtree[2], subtree, buffer);
-		}		
-		return;
-	}
-
-	//
-	// byte was not referenced, just emit 8 bits
-	//
-	Huff_EmitByteDynamic(tree, NOT_REFERENCED, buffer);
-
-	for (i = 7; i >= 0; i--)
-	{
-		Huff_EmitBit((value >> i) & 1, buffer);
-	}
-
-}
-
-/*
-=======================================================================================
-
-  PUBLIC INTERFACE
-
-=======================================================================================
-*/
-
-/*
-============
-Huff_CompressPacket
-
-Compress message using dynamic Huffman tree,
-beginning from specified offset
-============
-*/
-void Huff_EncryptPacket(sizebuf_t *msg, int offset)
-{
-	tree_t	tree;
-	byte	buffer[MAX_HUFF_BUF_SIZE];
-	byte	*data;
-	int		outLen;
-	int		inLen;
-	int		i;
-
-	data = msg->data + offset;
-	inLen = msg->cursize - offset;
-	if (inLen <= 0 || inLen >= MAX_HUFF_BUF_SIZE)
-	{
-		return;
-	}
-
-	Huff_PrepareTree(tree);
-
-	buffer[0] = inLen >> 8;
-	buffer[1] = inLen & 0xFF;
-	huffBitPos = 16;
-
-	for (i = 0; i < inLen; i++)
-	{
-		Huff_EmitByteDynamic(tree, data[i], buffer);
-		Huff_AddReference(tree, data[i]);
-	}
-	
-	outLen = (huffBitPos >> 3) + 1;
-
-	msg->cursize = offset + outLen;
-	memcpy(data, buffer, outLen);
-
-}
-
-/*
-============
-Huff_DecompressPacket
-
-Decompress message using dynamic Huffman tree,
-beginning from specified offset
-============
-*/
-void Huff_DecryptPacket(sizebuf_t *msg, int offset)
-{
-	tree_t	tree;
-	byte	buffer[MAX_HUFF_BUF_SIZE];
-	byte	*data;
-	int		outLen;
-	int		inLen;
-	int		i, j;
-	int		ch;
-
-	data = msg->data + offset;
-	inLen = msg->cursize - offset;
-	if (inLen <= 0)
-	{
-		return;
-	}
-
-	Huff_PrepareTree(tree);
-
-	outLen = (data[0] << 8) + data[1];
-	huffBitPos = 16;
-	
-	if (outLen > msg->maxsize - offset)
-	{
-		outLen = msg->maxsize - offset;
-	}
-
-	for (i = 0; i < outLen; i++)
-	{
-		if ((huffBitPos >> 3) > inLen)
-		{
-			buffer[i] = 0;
-			break;
-		}
-
-		ch = Huff_GetByteFromTree((void**)tree[2], data);
-
-		if (ch == NOT_REFERENCED)
-		{
-			ch = 0; // just read 8 bits
-			for (j = 0 ; j < 8 ; j++)
-			{
-				ch <<= 1;
-				ch |= Huff_GetBit(data);
-			}
-		}
-
-		buffer[i] = ch;
-		Huff_AddReference(tree, ch);
-	}
-
-
-	msg->cursize = offset + outLen;
-	memcpy(data, buffer, outLen);
-}
-
-/*
-============
-Huff_EmitByte
-============
-*/
-void Huff_EmitByte(int ch, byte *buffer, int *count)
-{
-	huffBitPos = *count;
-	Huff_EmitPathToByte((void**)huffTree[ch + 5], NULL, buffer);
-	*count = huffBitPos;
-}
-
-/*
-============
-Huff_GetByte
-============
-*/
-int Huff_GetByte(byte *buffer, int *count)
-{
-	int ch;
-
-	huffBitPos = *count;
-	ch = Huff_GetByteFromTree((void**)huffTree[2], buffer);
-	*count = huffBitPos;
-
-	return ch;
-}
-
-static qbool madetable;
-/*
-============
-Huff_Init
-============
-*/
-void Huff_Init(int *huffCounts)
-{
-	int	i, j;
-
-	if (!huffCounts)
-		huffCounts = q3huffCounts;
-
-	// build empty tree
-	Huff_PrepareTree(huffTree);
-
-	// add all pre-defined byte references
-	for (i = 0; i < 256; i++)
-	{
-		for (j = 0; j < huffCounts[i]; j++)
-		{
-			Huff_AddReference(huffTree, i);
-		}
-		huffCounts[i] = LittleLong(huffCounts[i]);
-	}
-
-	for(i=0;i<256;i++)
-		huffCounts[i] = LittleLong(huffCounts[i]);
-
-	madetable = true;
-}
-
-/*
-============
-Huff_CompressPacket
-
-Compress message using loaded Huffman tree,
-beginning from specified offset
-============
-*/
-void Huff_CompressPacket( sizebuf_t *msg, int offset )
-{
-	byte	buffer[MAX_HUFF_BUF_SIZE];
-	byte	*data;
-	int		outLen;
-	int		inLen;
-	int		i;
-
-	if (!madetable)
-		Huff_Init(NULL);
-
-	data = msg->data + offset;
-	inLen = msg->cursize - offset;	
-	if (inLen <= 0 || inLen >= MAX_HUFF_BUF_SIZE)
-	{
-		return;
-	}
-
-	outLen = 0;
-	for (i=0; i < inLen; i++)
-	{
-		if (i == MAX_HUFF_BUF_SIZE)
-			Sys_Error("Compression became too large\n");
-		Huff_EmitByte(data[i], buffer, &outLen);
-
-		countinghuffCounts[data[i]]++;
-	}
-
-	outLen = (huffBitPos >> 3) + 1;
-
-	if (outLen > inLen)
-	{
-		memmove(data+1, data, inLen);
-		data[0] = 0x80;	//this would have grown the packet.
-		msg->cursize+=1;
-		return;	//cap it at only 1 byte growth.
-	}
-
-	msg->cursize = offset + outLen;
-	{	//add the bitcount
-		data[0] = (outLen<<3) - huffBitPos;
-		data+=1;
-		msg->cursize+=1;
-	}
-	if (msg->cursize > msg->maxsize)
-		Sys_Error("Compression became too large\n");
-	memcpy(data, buffer, outLen);
-}
-
-/*
-============
-Huff_DecompressPacket
-
-Decompress message using loaded Huffman tree,
-beginning from specified offset
-============
-*/
-void Huff_DecompressPacket(sizebuf_t *msg, int offset)
-{
-	byte	buffer[MAX_HUFF_BUF_SIZE];
-	byte	*data;
-	int		outLen;
-	int		inLen;
-	int		i;
-
-	if (!madetable)
-		Huff_Init(NULL);
-
-	data = msg->data + offset;
-	inLen = msg->cursize - offset;	
-	if (inLen <= 0 || inLen >= MAX_HUFF_BUF_SIZE)
-	{
-		return;
-	}
-
-	inLen<<=3;
-	{	//add the bitcount
-		inLen = inLen-8-data[0];
-		if (data[0]&0x80)
-		{	//packet would have grown.
-			msg->cursize -= 1;
-			memmove(data, data+1, msg->cursize);
-			return;	//this never happened, okay?
-		}
-		data+=1;
-	}
-
-	outLen = 0;
-	for(i=0; outLen < inLen; i++)
-	{
-		if (i == MAX_HUFF_BUF_SIZE)
-			Sys_Error("Decompression became too large\n");
-		buffer[i] = Huff_GetByte(data, &outLen);
-	}
-	
-	msg->cursize = offset + i;
-	if (msg->cursize > msg->maxsize)
-		Sys_Error("Decompression became too large\n");
-	memcpy(msg->data + offset, buffer, i);
-}
-
-

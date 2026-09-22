@@ -1,425 +1,380 @@
-/*
-	peer.c
-*/
+//! Forwarded clients ("peers"): one remote-facing socket per connected client.
 
-#include "qwfwd.h"
+use std::net::SocketAddrV4;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-peer_t *peers = NULL;
-static int userid = 0;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-peer_t	*FWD_peer_by_addr(struct sockaddr_in *from)
-{
-	peer_t *p;
+use crate::cmd::Args;
+use crate::console::qstr;
+use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
+use crate::protocol::{A2A_ACK, CLC_STRINGCMD};
+use crate::proxy::Proxy;
+use crate::{cprint, dprint, info, net, parse};
 
-	for (p = peers; p; p = p->next)
-	{
-		if (NET_CompareAddress(&p->from, from))
-			return p;
-	}
+/// Clients silent this long are dropped.
+const PEER_TIMEOUT: Duration = Duration::from_secs(15);
+const CHALLENGE_RESEND: Duration = Duration::from_secs(2);
+/// Q3 idle probe: after this much silence, poke the server so it tells us if it dropped the client.
+const Q3_IDLE: Duration = Duration::from_secs(1);
+const Q3_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 
-	return NULL;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Protocol {
+    Qw,
+    Q3,
 }
 
-static int parse_color(const char *userinfo, const char *key)
-{
-	char tmp[MAX_INFO_STRING];
-	int color;
-
-	Info_ValueForKey(userinfo, key, tmp, sizeof(tmp));
-	color = atoi(tmp);
-
-	return (color < 0) ? 0 : ((color > 16) ? 16 : color);
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PeerState {
+    /// Scheduled for removal.
+    Drop,
+    /// Waiting on a challenge from the remote server.
+    Challenge,
+    Connected,
 }
 
-peer_t	*FWD_peer_new(const char *remote_host, int remote_port, struct sockaddr_in *from, const char *userinfo, int qport, protocol_t proto, qbool link)
-{
-	peer_t *p;
-	struct sockaddr_in to;
-	int s = INVALID_SOCKET;
-	qbool new_peer = false;
-
-	if (!NET_GetSockAddrIn_ByHostAndPort(&to, remote_host, remote_port))
-		return NULL; // failed to resolve host name?
-
-	if (!SV_IsWhitelisted(&to))
-		return NULL;
-
-	// check for bans.
-	if (SV_IsBanned(&to))
-		return NULL;
-
-	// we probably already have such peer, reuse it then
-	p = FWD_peer_by_addr( from );
-
-	// next check for NEW peer only
-	if ( !p )
-	{
-		new_peer = true; // it will be new peer
-
-		if (FWD_peers_count() >= maxclients->integer)
-			return NULL; // we already full!
-
-		// NOTE: socket allocated here! Do not forget free it!!!
-		if ((s = NET_UDP_OpenSocket(NULL, 0, false)) == INVALID_SOCKET)
-			return NULL; // out of sockets?
-
-		p = Sys_malloc(sizeof(*p)); // alloc peer if needed
-	}
-
-	p->s		= ( new_peer ) ? s : p->s; // reuse socket in case of reusing
-	p->from		= *from;
-	p->to		= to;
-	p->ps		= ( !new_peer && proto == pr_q3 ) ? p->ps : ps_challenge; // do not reset state for q3 in case of peer reusing
-	p->qport	= qport;
-	p->proto	= proto;
-	strlcpy(p->userinfo, userinfo, sizeof(p->userinfo));
-	Info_ValueForKey(userinfo, "name", p->name, sizeof(p->name));
-	p->top          = parse_color(userinfo, "topcolor");
-	p->bottom       = parse_color(userinfo, "bottomcolor");
-	p->userid	= ( new_peer ) ? ++userid : p->userid; // do not bump userid in case of peer reusing
-
-	time(&p->last);
-
-	// link only new peer, in case of reusing it already done...
-	if (new_peer && link)
-	{
-		p->next = peers;
-		peers = p;
-	}
-
-	return p;
+/// A datagram received on a peer's remote-facing socket.
+pub struct PeerPacket {
+    pub userid: i32,
+    pub from: SocketAddrV4,
+    pub data: Vec<u8>,
 }
 
-// free peer data, perform unlink if requested
-static void FWD_peer_free(peer_t *peer, qbool unlink)
-{
-	if (!peer)
-		return;
-
-	if (unlink)
-	{
-		peer_t *next, *prev, *current;
-
-		prev = NULL;
-		current = peers;
-
-		for ( ; current; )
-		{
-			next = current->next;
-
-			if (peer == current)
-			{
-				if (prev)
-					prev->next = next;
-				else
-					peers = next;
-
-				break;
-			}
-
-			prev = current;
-			current = next;
-		}
-	}
-
-	// free all data related to peer
-	if (peer->s) // there should be no zero socket, it's stdin
-		closesocket(peer->s);
-	Sys_free(peer);
+pub struct Peer {
+    pub userid: i32,
+    /// The client.
+    pub from: SocketAddrV4,
+    /// The remote server.
+    pub to: SocketAddrV4,
+    pub socket: Arc<UdpSocket>,
+    reader: JoinHandle<()>,
+    pub state: PeerState,
+    pub proto: Protocol,
+    pub challenge: i32,
+    pub userinfo: Vec<u8>,
+    pub name: Vec<u8>,
+    pub top_color: i32,
+    pub bottom_color: i32,
+    pub qport: i32,
+    pub last_seen: Instant,
+    pub connected_at: Instant,
+    last_challenge_at: Option<Instant>,
+    last_q3_probe_at: Option<Instant>,
 }
 
-static void FWD_check_timeout(void)
-{
-	byte msg_data[6];
-	sizebuf_t msg;
-	time_t cur_time;
-	double d_cur_time;
-	peer_t *p;
-
-	SZ_InitEx(&msg, msg_data, sizeof(msg_data), true);
-
-	cur_time = time(NULL);
-	d_cur_time = Sys_DoubleTime();
-
-	for (p = peers; p; p = p->next)
-	{
-		// this is helper for q3 to guess disconnect asap
-		if (p->proto == pr_q3)
-		{
-			if (cur_time - p->last > 1 && d_cur_time - p->q3_disconnect_check > 0.05 && p->ps == ps_connected)
-			{
-				p->q3_disconnect_check = d_cur_time;
-				SZ_Clear(&msg);
-				MSG_WriteLong(&msg, 0);
-				MSG_WriteShort(&msg, p->qport);
-				NET_SendPacket(p->s, msg.cursize, msg.data, &p->to);
-			}
-		}
-
-		if (cur_time - p->last < 15) // few seconds timeout
-			continue;
-
-		Sys_DPrintf("peer %s:%d timed out\n", inet_ntoa(p->from.sin_addr), (int)ntohs(p->from.sin_port));
-
-		p->ps = ps_drop;
-	}
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
-static void FWD_check_drop(void)
-{
-	peer_t *p, *next;
+impl Peer {
+    fn apply_userinfo(&mut self, userinfo: &[u8]) {
+        self.userinfo = userinfo.to_vec();
+        self.name = info::value_for_key(userinfo, b"name").to_vec();
+        self.top_color = parse_color(userinfo, b"topcolor");
+        self.bottom_color = parse_color(userinfo, b"bottomcolor");
+    }
 
-	for (p = peers; p; p = next)
-	{
-		next = p->next;
-
-		if (p->ps != ps_drop)
-			continue;
-
-		Sys_DPrintf("peer %s:%d dropped\n", inet_ntoa(p->from.sin_addr), (int)ntohs(p->from.sin_port));
-		FWD_peer_free(p, true); // NOTE: 'p' is not valid after this function, so we remember 'next' before this function
-	}
+    pub fn minutes_connected(&self) -> u64 {
+        self.connected_at.elapsed().as_secs() / 60
+    }
 }
 
-static void FWD_network_update(void)
-{
-	fd_set rfds;
-	struct timeval tv;
-	int retval;
-	int i1;
-	peer_t *p;
-
-	FD_ZERO(&rfds);
-
-	// select on main server socket
-	FD_SET(net_socket, &rfds);
-	i1 = net_socket + 1;
-
-	for (p = peers; p; p = p->next)
-	{
-		// select on peers sockets
-		FD_SET(p->s, &rfds);
-		if (p->s >= i1)
-			i1 = p->s + 1;
-	}
-
-// if not DLL - read stdin
-#ifndef APP_DLL
-	#ifndef _WIN32
-	// try read stdin only if connected to a terminal.
-	if (isatty(STDIN) && isatty(STDOUT))
-	{
-		FD_SET(STDIN, &rfds);
-		if (STDIN >= i1)
-			i1 = STDIN + 1;
-	}
-	#endif // _WIN32
-#endif
-
-	/* Sleep for some time, wake up immidiately if there input packet. */
-	tv.tv_sec = 0;
-	tv.tv_usec = 100000; // 100 ms
-
-retry:
-	retval = select(i1, &rfds, (fd_set *)0, (fd_set *)0, &tv);
-	if (retval < 0)
-	{
-		if (errno == EINTR)
-		{
-			goto retry;
-		}
-		perror("select");
-		return;
-	}
-
-	// read console input.
-	// NOTE: we do not do that if we are in DLL mode...
-	Sys_ReadSTDIN(&ps, rfds);
-
-	if (retval <= 0)
-		return;
-
-	// if we have input packet on main server/proxy socket, then read it
-	if(FD_ISSET(net_socket, &rfds))
-	{
-		qbool connectionless;
-		int cnt;
-
-		// read it
-		for(;;)
-		{
-			if (!NET_GetPacket(net_socket, &net_message))
-				break;
-
-			// check for bans.
-			if (SV_IsBanned(&net_from))
-				continue;
-
-			if (net_message.cursize == 1 && net_message.data[0] == A2A_ACK)
-			{
-				QRY_SV_PingReply();
-
-				continue;
-			}
-
-			MSG_BeginReading();
-			connectionless = (MSG_ReadLong() == -1);
-
-			if (connectionless)
-			{
-				if (MSG_BadRead())
-					continue;
-
-				if (!SV_ConnectionlessPacket())
-					continue; // seems we do not need forward it
-			}
-
-			// search in peers
-			for (p = peers; p; p = p->next)
-			{
-				// we have this peer already, so forward/send packet to remote server
-				if (NET_CompareAddress(&p->from, &net_from))
-					break;
-			}
-
-			// peer was not found
-			if (!p)
-				continue;
-
-			// forward data to the server/proxy
-			if (p->ps >= ps_connected)
-			{
-				cnt = 1; // one packet by default
-
-				// check for "drop" aka client disconnect,
-				// first 10 bytes for NON connectionless packet is netchan related shit in QW
-				if (p->proto == pr_qw && !connectionless && net_message.cursize > 10 && net_message.data[10] == clc_stringcmd)
-				{
-					if (!strcmp((char*)net_message.data + 10 + 1, "drop"))
-					{
-//						Sys_Printf("peer drop detected\n");
-						p->ps = ps_drop; // drop peer ASAP
-						cnt = 3; // send few packets due to possibile packet lost
-					}
-				}
-
-				for ( ; cnt > 0; cnt--)
-					NET_SendPacket(p->s, net_message.cursize, net_message.data, &p->to);
-			}
-
-			time(&p->last);
-		}
-	}
-
-	// now lets check peers sockets, perhaps we have input packets too
-	for (p = peers; p; p = p->next)
-	{
-		if(FD_ISSET(p->s, &rfds))
-		{
-			// yeah, we have packet, read it then
-			for (;;)
-			{
-				if (!NET_GetPacket(p->s, &net_message))
-					break;
-
-				// check for bans.
-				if (SV_IsBanned(&net_from))
-					continue;
-
-				// we should check is this packet from remote server, this may be some evil packet from haxors...
-				if (!NET_CompareAddress(&p->to, &net_from))
-					continue;
-
-				MSG_BeginReading();
-				if (MSG_ReadLong() == -1)
-				{
-					if (MSG_BadRead())
-						continue;
-
-					if (!CL_ConnectionlessPacket(p))
-						continue; // seems we do not need forward it
-
-					NET_SendPacket(net_socket, net_message.cursize, net_message.data, &p->from);
-					continue;
-				}
-
-				if (p->ps >= ps_connected)
-					NET_SendPacket(net_socket, net_message.cursize, net_message.data, &p->from);
-
-// qqshka: commented out
-//				time(&p->last);
-
-			} // for (;;)
-		} // if(FD_ISSET(p->s, &rfds))
-
-		if (p->ps == ps_challenge)
-		{
-			// send challenge time to time
-			if (time(NULL) - p->connect > 2)
-			{
-				p->connect = time(NULL);
-				Netchan_OutOfBandPrint(p->s, &p->to, "getchallenge%s", p->proto == pr_qw ? "\n" : "");
-			}
-		}
-	} // for (p = peers; p; p = p->next)
+fn parse_color(userinfo: &[u8], key: &[u8]) -> i32 {
+    parse::atoi(info::value_for_key(userinfo, key)).clamp(0, 16)
 }
 
-int FWD_peers_count(void)
-{
-	int cnt;
-	peer_t *p;
-
-	for (cnt = 0, p = peers; p; p = p->next)
-	{
-		cnt++;
-	}
-
-	return cnt;
+/// Pumps datagrams from a peer's socket into the main loop.
+async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerPacket>) {
+    let mut buf = vec![0u8; MSG_BUF_SIZE];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, from)) => {
+                if len >= MSG_BUF_SIZE {
+                    cprint!("NET_GetPacket: Oversize packet from {}\n", from.ip());
+                    continue;
+                }
+                let Some(from) = net::v4(from) else { continue };
+                let packet = PeerPacket {
+                    userid,
+                    from,
+                    data: buf[..len].to_vec(),
+                };
+                if tx.send(packet).await.is_err() {
+                    return;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                dprint!("NET_GetPacket: Connection was forcibly closed\n");
+            }
+            Err(err) => {
+                cprint!("NET_GetPacket: recvfrom: {err}\n");
+                return;
+            }
+        }
+    }
 }
 
-//======================================================
+impl Proxy {
+    pub fn register_peer_commands(&mut self) {
+        self.cmds.register("cllist", cmd_cllist);
+    }
 
-static void FWD_Cmd_ClList_f(void)
-{
-	peer_t *p;
-	char ipport1[] = "xxx.xxx.xxx.xxx:xxxxx";
-	char ipport2[] = "xxx.xxx.xxx.xxx:xxxxx";
-	int idx;
-	time_t current = time(NULL);
+    pub fn peer_by_addr(&self, from: SocketAddrV4) -> Option<&Peer> {
+        self.peers.iter().find(|p| p.from == from)
+    }
 
-	Sys_Printf("=== client list ===\n");
-	Sys_Printf("##id## %-*s %-*s time name\n", sizeof(ipport1)-1, "address from", sizeof(ipport2)-1, "address to");
-	Sys_Printf("-----------------------------------------------------------------------\n");
+    fn peer_by_addr_mut(&mut self, from: SocketAddrV4) -> Option<&mut Peer> {
+        self.peers.iter_mut().find(|p| p.from == from)
+    }
 
-	for (idx = 1, p = peers; p; p = p->next, idx++)
-	{
-		Sys_Printf("%6d %-*s %-*s %4d %s\n",
-			p->userid,
-			sizeof(ipport1)-1, NET_AdrToString(&p->from, ipport1, sizeof(ipport1)),
-			sizeof(ipport2)-1, NET_AdrToString(&p->to,   ipport2, sizeof(ipport2)),
-			(int)(current - p->connect)/60, p->name);
-	}
+    /// Registers a client for forwarding to `host:port`, reusing an existing
+    /// peer for the same client address. Returns the peer's index.
+    pub async fn peer_new(
+        &mut self,
+        host: &str,
+        port: u16,
+        from: SocketAddrV4,
+        userinfo: &[u8],
+        qport: i32,
+        proto: Protocol,
+    ) -> Option<usize> {
+        let to = net::resolve(host, port).await?;
+        if !self.whitelist.allows(*to.ip()) || self.bans.is_banned(to) {
+            return None;
+        }
 
-	Sys_Printf("-----------------------------------------------------------------------\n");
-	Sys_Printf("%d clients\n", idx-1);
+        if let Some(index) = self.peers.iter().position(|p| p.from == from) {
+            let peer = &mut self.peers[index];
+            peer.to = to;
+            // A reconnecting Q3 client keeps its state; the server side is unaware of the reconnect.
+            if proto != Protocol::Q3 {
+                peer.state = PeerState::Challenge;
+            }
+            peer.qport = qport;
+            peer.proto = proto;
+            peer.apply_userinfo(userinfo);
+            peer.last_seen = Instant::now();
+            return Some(index);
+        }
+
+        if self.peers.len() >= self.max_clients() {
+            return None;
+        }
+        let socket = Arc::new(net::open_ephemeral_socket().await.ok()?);
+        self.next_userid += 1;
+        let userid = self.next_userid;
+        let reader = tokio::spawn(peer_reader(
+            userid,
+            Arc::clone(&socket),
+            self.peer_tx.clone(),
+        ));
+
+        let now = Instant::now();
+        let mut peer = Peer {
+            userid,
+            from,
+            to,
+            socket,
+            reader,
+            state: PeerState::Challenge,
+            proto,
+            challenge: 0,
+            userinfo: Vec::new(),
+            name: Vec::new(),
+            top_color: 0,
+            bottom_color: 0,
+            qport,
+            last_seen: now,
+            connected_at: now,
+            last_challenge_at: None,
+            last_q3_probe_at: None,
+        };
+        peer.apply_userinfo(userinfo);
+        self.peers.push(peer);
+        Some(self.peers.len() - 1)
+    }
+
+    pub fn max_clients(&self) -> usize {
+        usize::try_from(self.cvars.int("maxclients")).unwrap_or(0)
+    }
+
+    /// Handles a datagram from a client on the proxy socket.
+    pub async fn handle_client_packet(
+        &mut self,
+        socket: &UdpSocket,
+        from: SocketAddrV4,
+        msg: &mut Vec<u8>,
+    ) {
+        if self.bans.is_banned(from) {
+            return;
+        }
+        if msg.as_slice() == [A2A_ACK] {
+            self.query.ping_reply(&self.cvars, from);
+            return;
+        }
+
+        let connectionless = match MsgReader::new(msg).read_long() {
+            None => return,
+            Some(-1) => true,
+            Some(_) => false,
+        };
+        if connectionless && !self.sv_connectionless(socket, from, msg).await {
+            return;
+        }
+
+        let Some(peer) = self.peer_by_addr_mut(from) else {
+            return;
+        };
+        if peer.state == PeerState::Connected {
+            let mut copies = 1;
+            if peer.proto == Protocol::Qw && !connectionless && is_drop_command(msg) {
+                peer.state = PeerState::Drop;
+                // The client is leaving; repeat so the server hears it despite packet loss.
+                copies = 3;
+            }
+            for _ in 0..copies {
+                net::send(&peer.socket, msg, peer.to);
+            }
+        }
+        peer.last_seen = Instant::now();
+    }
+
+    /// Handles a datagram from a remote server on a peer's socket.
+    pub fn handle_server_packet(&mut self, socket: &UdpSocket, packet: PeerPacket) {
+        if self.bans.is_banned(packet.from) {
+            return;
+        }
+        let Some(peer) = self.peers.iter_mut().find(|p| p.userid == packet.userid) else {
+            return;
+        };
+        if peer.to != packet.from {
+            return;
+        }
+
+        match MsgReader::new(&packet.data).read_long() {
+            None => {}
+            Some(-1) => {
+                if peer.cl_connectionless(&packet.data) {
+                    net::send(socket, &packet.data, peer.from);
+                }
+            }
+            Some(_) if peer.state == PeerState::Connected => {
+                net::send(socket, &packet.data, peer.from);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Times out silent peers, re-sends pending challenges and probes idle Q3 servers.
+    pub fn peer_maintenance(&mut self) {
+        let now = Instant::now();
+        for peer in &mut self.peers {
+            if peer.proto == Protocol::Q3
+                && peer.state == PeerState::Connected
+                && now.duration_since(peer.last_seen) > Q3_IDLE
+                && peer
+                    .last_q3_probe_at
+                    .is_none_or(|t| now.duration_since(t) > Q3_PROBE_INTERVAL)
+            {
+                peer.last_q3_probe_at = Some(now);
+                let mut probe = MsgWriter::new(6);
+                probe.write_long(0);
+                probe.write_short(peer.qport as i16);
+                net::send(&peer.socket, probe.as_bytes(), peer.to);
+            }
+
+            if peer.state == PeerState::Challenge
+                && peer
+                    .last_challenge_at
+                    .is_none_or(|t| now.duration_since(t) > CHALLENGE_RESEND)
+            {
+                peer.last_challenge_at = Some(now);
+                let request = match peer.proto {
+                    Protocol::Qw => "getchallenge\n",
+                    Protocol::Q3 => "getchallenge",
+                };
+                net::send_oob_print(&peer.socket, peer.to, request);
+            }
+
+            if now.duration_since(peer.last_seen) >= PEER_TIMEOUT {
+                dprint!("peer {} timed out\n", peer.from);
+                peer.state = PeerState::Drop;
+            }
+        }
+    }
+
+    pub fn drop_dead_peers(&mut self) {
+        self.peers.retain(|peer| {
+            if peer.state == PeerState::Drop {
+                dprint!("peer {} dropped\n", peer.from);
+            }
+            peer.state != PeerState::Drop
+        });
+    }
 }
 
-//======================================================
-
-void FWD_update_peers(void)
-{
-	FWD_network_update();
-	FWD_check_timeout();
-	FWD_check_drop();
+/// A QuakeWorld game packet whose first command is the client's `drop`.
+/// The netchan header occupies the first 10 bytes.
+fn is_drop_command(msg: &[u8]) -> bool {
+    if msg.len() <= 10 || msg[10] != CLC_STRINGCMD {
+        return false;
+    }
+    let text = &msg[11..];
+    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+    &text[..end] == b"drop"
 }
 
-//======================================================
-
-void FWD_Init(void)
-{
-	peers = NULL;
-	userid = 0;
-
-	Cmd_AddCommand("cllist", FWD_Cmd_ClList_f);
+fn cmd_cllist(proxy: &mut Proxy, _args: &Args) {
+    cprint!("=== client list ===\n");
+    cprint!(
+        "##id## {:<21} {:<21} time name\n",
+        "address from",
+        "address to"
+    );
+    cprint!("-----------------------------------------------------------------------\n");
+    for peer in &proxy.peers {
+        cprint!(
+            "{:6} {:<21} {:<21} {:4} {}\n",
+            peer.userid,
+            peer.from,
+            peer.to,
+            peer.minutes_connected(),
+            qstr(&peer.name)
+        );
+    }
+    cprint!("-----------------------------------------------------------------------\n");
+    cprint!("{} clients\n", proxy.peers.len());
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_drop_command() {
+        let mut msg = vec![0u8; 10];
+        msg.push(CLC_STRINGCMD);
+        msg.extend_from_slice(b"drop\0");
+        assert!(is_drop_command(&msg));
+        msg.truncate(15);
+        assert!(is_drop_command(&msg));
+        msg.extend_from_slice(b"ped");
+        assert!(!is_drop_command(&msg));
+        assert!(!is_drop_command(&[0u8; 11]));
+        assert!(!is_drop_command(b"short"));
+    }
+
+    #[test]
+    fn colors_are_clamped() {
+        assert_eq!(parse_color(b"\\topcolor\\4", b"topcolor"), 4);
+        assert_eq!(parse_color(b"\\topcolor\\99", b"topcolor"), 16);
+        assert_eq!(parse_color(b"\\topcolor\\-3", b"topcolor"), 0);
+        assert_eq!(parse_color(b"\\name\\x", b"topcolor"), 0);
+    }
+}

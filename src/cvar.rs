@@ -1,533 +1,307 @@
-/*
-Copyright (C) 1996-1997 Id Software, Inc.
+//! Console variables and the commands that inspect them.
 
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
+use std::collections::BTreeMap;
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+use crate::cmd::Args;
+use crate::info::MAX_INFO_STRING;
+use crate::proxy::Proxy;
+use crate::{console, cprint, dprint, info, parse};
 
-See the GNU General Public License for more details.
+pub const ARCHIVE: u32 = 1 << 0;
+/// Mirrored into the serverinfo string.
+pub const SERVERINFO: u32 = 1 << 1;
+/// Settable from the command line or config during startup only.
+pub const NOSET: u32 = 1 << 2;
+pub const READONLY: u32 = 1 << 3;
+/// Created by a `set` command rather than by the program.
+pub const USER_CREATED: u32 = 1 << 4;
 
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
-
-*/
-// cvar.c -- dynamic variable tracking
-
-#include "qwfwd.h"
-
-static cvar_t *Cvar_Create(const char *var_name, const char *value, int cvarflags);
-static cvar_t *Cvar_Set2(const char *var_name, const char *value, qbool force);
-
-static cvar_t	*cvar_hash[32];
-static cvar_t	*cvar_vars;
-
-/*
-==========
-Key
-==========
-Returns hash key for a string
-*/
-static int Key (const char *name)
-{
-	int	v;
-	int c;
-
-	v = 0;
-	while ( (c = *name++) != 0 )
-		//		v += *name;
-		v += c &~ 32;	// very lame, but works (case insensitivity)
-
-	return v % 32;
+#[derive(Debug, Clone)]
+pub struct Cvar {
+    pub name: String,
+    pub string: String,
+    pub value: f32,
+    pub integer: i32,
+    pub flags: u32,
+    pub modified: bool,
 }
 
-/*
-============
-Cvar_Find
-============
-*/
-cvar_t *Cvar_Find (const char *var_name)
-{
-	cvar_t	*var;
-	int		key;
-
-	key = Key (var_name);
-
-	for (var=cvar_hash[key] ; var ; var=var->hash_next)
-		if (!stricmp (var_name, var->name))
-			return var;
-
-	return NULL;
+#[derive(Default)]
+pub struct Cvars {
+    vars: BTreeMap<String, Cvar>,
+    pub serverinfo: Vec<u8>,
+    /// Once startup completes, NOSET cvars become write protected.
+    pub locked: bool,
 }
 
-/*
-============
-Cvar_Value
-============
-*/
-float Cvar_Value (const char *var_name)
-{
-	cvar_t	*var = Cvar_Find (var_name);
-	return ( var ) ? var->value : 0;
+impl Cvars {
+    pub fn find(&self, name: &str) -> Option<&Cvar> {
+        self.vars.get(&name.to_ascii_lowercase())
+    }
+
+    fn find_mut(&mut self, name: &str) -> Option<&mut Cvar> {
+        self.vars.get_mut(&name.to_ascii_lowercase())
+    }
+
+    pub fn string(&self, name: &str) -> &str {
+        self.find(name).map_or("", |v| v.string.as_str())
+    }
+
+    pub fn int(&self, name: &str) -> i32 {
+        self.find(name).map_or(0, |v| v.integer)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Cvar> {
+        self.vars.values()
+    }
+
+    /// Returns whether the cvar changed since the last call and clears the flag.
+    pub fn take_modified(&mut self, name: &str) -> bool {
+        self.find_mut(name)
+            .is_some_and(|v| std::mem::take(&mut v.modified))
+    }
+
+    pub fn mark_modified(&mut self, name: &str) {
+        if let Some(v) = self.find_mut(name) {
+            v.modified = true;
+        }
+    }
+
+    /// Registers a cvar with a default, keeping any value a config already
+    /// gave it unless the cvar is read only.
+    pub fn get(&mut self, name: &str, default: &str, flags: u32) {
+        match self.find_mut(name) {
+            Some(var) if flags & READONLY != 0 => {
+                var.flags = flags;
+                self.force_set(name, default);
+            }
+            Some(var) => var.flags |= flags,
+            None => self.create(name, default, flags),
+        }
+        if flags & USER_CREATED == 0
+            && let Some(var) = self.find_mut(name)
+        {
+            var.flags &= !USER_CREATED;
+        }
+    }
+
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.set_internal(name, value, false);
+    }
+
+    pub fn force_set(&mut self, name: &str, value: &str) {
+        self.set_internal(name, value, true);
+    }
+
+    /// Creates or overwrites a cvar, replacing its flags outright.
+    pub fn full_set(&mut self, name: &str, value: &str, flags: u32) {
+        match self.find_mut(name) {
+            Some(var) => {
+                var.flags = flags;
+                self.force_set(name, value);
+            }
+            None => self.get(name, value, flags),
+        }
+    }
+
+    pub fn set_value(&mut self, name: &str, value: f32) {
+        self.set(name, &value.to_string());
+    }
+
+    pub fn create(&mut self, name: &str, value: &str, flags: u32) {
+        if self.find(name).is_some() {
+            dprint!("Cvar_Create: cvar {name} already exist, unexpected\n");
+            return;
+        }
+        self.vars.insert(
+            name.to_ascii_lowercase(),
+            Cvar {
+                name: name.to_owned(),
+                string: String::new(),
+                value: 0.0,
+                integer: 0,
+                flags,
+                modified: false,
+            },
+        );
+        self.force_set(name, value);
+    }
+
+    fn set_internal(&mut self, name: &str, value: &str, force: bool) {
+        let locked = self.locked;
+        let Some(var) = self.find_mut(name) else {
+            self.create(name, value, 0);
+            return;
+        };
+
+        if !force && (var.flags & READONLY != 0 || (var.flags & NOSET != 0 && locked)) {
+            cprint!("{name} is write protected.\n");
+            return;
+        }
+
+        var.string = value.to_owned();
+        var.value = parse::atof(value.as_bytes()) as f32;
+        var.integer = parse::atoi(value.as_bytes());
+        var.modified = true;
+        let (display_name, flags, integer) = (var.name.clone(), var.flags, var.integer);
+
+        if display_name.eq_ignore_ascii_case("developer") {
+            console::set_developer(integer);
+        }
+
+        if flags & SERVERINFO != 0
+            && info::value_for_key(&self.serverinfo, display_name.as_bytes()) != value.as_bytes()
+        {
+            info::set_value_for_star_key(
+                &mut self.serverinfo,
+                display_name.as_bytes(),
+                value.as_bytes(),
+                MAX_INFO_STRING,
+                true,
+            );
+        }
+    }
 }
 
-/*
-============
-Cvar_String
-============
-*/
-char *Cvar_String (const char *var_name)
-{
-	cvar_t *var = Cvar_Find (var_name);
-	return ( var ) ? var->string : "";
+impl Proxy {
+    pub fn register_cvar_commands(&mut self) {
+        self.cmds.register("cvarlist", cmd_cvarlist);
+        self.cmds.register("toggle", cmd_toggle);
+        self.cmds.register("set", cmd_set);
+        self.cmds.register("inc", cmd_inc);
+    }
+
+    /// Handles `<cvar>` (print) and `<cvar> <value>` (assign) console lines.
+    pub fn cvar_command(&mut self, args: &Args) -> bool {
+        let Some(var) = self.cvars.find(&args.arg_str(0)) else {
+            return false;
+        };
+        if args.argc() == 1 {
+            cprint!("\"{}\" is \"{}\"\n", var.name, var.string);
+        } else {
+            let name = var.name.clone();
+            let value = args.join(1, args.argc() - 1);
+            self.cvars.set(&name, &value);
+        }
+        true
+    }
 }
 
-/*
-============
-Cvar_Get
-// Creates the variable if it doesn't exist.
-// If the variable already exists, the value will not be set (unless ROM)
-// The flags will be or'ed and default value overwritten in if the variable exists.
-============
-*/
-cvar_t *Cvar_Get(const char *var_name, const char *value, int flags)
-{
-	cvar_t *var;
-
-	if( !var_name || !var_name[0] )
-	{
-		Sys_Error("Cvar_Get: zero cvar name\n");
-		return NULL;
-	}
-
-	if ( !value )
-		value = "";
-
-	var = Cvar_Find(var_name);
-
-	if (var)
-	{
-		// var already exist.
-		// in case ot READ ONLY we set it for sanity, so it can't be set to wrong previously by user etc.
-
-		if (flags & CVAR_READONLY)
-		{
-			// read only var, reset flags and force set value
-			var->flags = flags;
-			Cvar_ForceSet(var_name, value);
-		}
-		else
-		{
-			// normal var, just "or" flags
-			var->flags |= flags;		
-		}
-	}
-	else
-	{
-		// create new one
-		var = Cvar_Create (var_name, value, flags);
-	}
-
-	// remove possible user created flag
-	if (!(flags & CVAR_USER_CREATED))
-		var->flags &= ~CVAR_USER_CREATED;
-
-	return var;
+fn cmd_cvarlist(proxy: &mut Proxy, _args: &Args) {
+    let mut count = 0;
+    for var in proxy.cvars.iter() {
+        cprint!(
+            "{}{} {}\n",
+            if var.flags & ARCHIVE != 0 { '*' } else { ' ' },
+            if var.flags & SERVERINFO != 0 {
+                's'
+            } else {
+                ' '
+            },
+            var.name
+        );
+        count += 1;
+    }
+    cprint!("------------\n{count} variables\n");
 }
 
-//
-// FIXME
-//
-static void SV_SendServerInfoChange(char *key, char *value)
-{
-//	Sys_DPrintf("SV_SendServerInfoChange FIXME\n");
+fn cmd_toggle(proxy: &mut Proxy, args: &Args) {
+    if args.argc() != 2 {
+        cprint!("toggle <cvar> : toggle a cvar on/off\n");
+        return;
+    }
+    let name = args.arg_str(1);
+    let Some(var) = proxy.cvars.find(&name) else {
+        cprint!("Unknown variable \"{name}\"\n");
+        return;
+    };
+    let (name, toggled) = (var.name.clone(), if var.value != 0.0 { "0" } else { "1" });
+    proxy.cvars.set(&name, toggled);
 }
 
-/*
-============
-Cvar_Set2
-============
-*/
-static cvar_t *Cvar_Set2(const char *var_name, const char *value, qbool force)
-{
-	char *tmp;
-	cvar_t	*var = Cvar_Find (var_name);
-
-	if (!var)
-	{
-		return Cvar_Create(var_name, value, 0);
-	}
-
-	// not set if read only and not forced
-	if (!force)
-	{
-		if ((var->flags & CVAR_READONLY) || ((var->flags & CVAR_NOSET) && ps.initialized))
-		{
-			Sys_Printf("%s is write protected.\n", var_name);
-			return var;
-		}
-	}
-
-	tmp = Sys_strdup (value);						// allocate new value, we do it before mem free so
-													// Cvar_Set(var, var->string) works without problems
-	Sys_free (var->string);							// NOW SAFE to free the old buffer
-	var->string = tmp;								// assign new value
-	var->value = atof (var->string);				// set right value
-	var->integer = atoi (var->string);
-	var->modified = true;
-
-	if (var->flags & CVAR_SERVERINFO)
-	{
-		char buf[MAX_INFO_KEY];
-		if (strcmp(var->string, Info_ValueForKey (ps.info, var->name, buf, sizeof(buf))))
-		{
-			Info_SetValueForStarKey (ps.info, var->name, var->string, sizeof(ps.info));
-			SV_SendServerInfoChange(var->name, var->string);
-		}
-	}
-
-	return var;
+fn cmd_set(proxy: &mut Proxy, args: &Args) {
+    if args.argc() < 3 {
+        cprint!("usage: set <cvar> <value>\n");
+        return;
+    }
+    let name = args.arg_str(1).into_owned();
+    let value = args.join(2, args.argc() - 1);
+    if proxy.cvars.find(&name).is_some() {
+        proxy.cvars.set(&name, &value);
+    } else {
+        proxy.cvars.create(&name, &value, USER_CREATED);
+    }
 }
 
-/*
-============
-Cvar_Set
-============
-*/
-cvar_t *Cvar_Set(const char *var_name, const char *value)
-{
-	return Cvar_Set2(var_name, value, false);
+fn cmd_inc(proxy: &mut Proxy, args: &Args) {
+    if !matches!(args.argc(), 2 | 3) {
+        cprint!("inc <cvar> [value]\n");
+        return;
+    }
+    let name = args.arg_str(1);
+    let Some(var) = proxy.cvars.find(&name) else {
+        cprint!("Unknown variable \"{name}\"\n");
+        return;
+    };
+    let delta = if args.argc() == 3 {
+        parse::atof(args.arg(2)) as f32
+    } else {
+        1.0
+    };
+    let (name, value) = (var.name.clone(), var.value + delta);
+    proxy.cvars.set_value(&name, value);
 }
 
-/*
-============
-Cvar_ForceSet
-============
-*/
-cvar_t *Cvar_ForceSet(const char *var_name, const char *value)
-{
-	return Cvar_Set2(var_name, value, true);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_keeps_config_values_and_clears_user_flag() {
+        let mut cvars = Cvars::default();
+        cvars.create("net_port", "1234", USER_CREATED);
+        cvars.get("net_port", "30000", NOSET);
+        let var = cvars.find("NET_PORT").unwrap();
+        assert_eq!(var.string, "1234");
+        assert_eq!(var.integer, 1234);
+        assert_eq!(var.flags, NOSET);
+        assert!(var.modified);
+    }
+
+    #[test]
+    fn readonly_and_noset_are_protected() {
+        let mut cvars = Cvars::default();
+        cvars.get("*version", "v1", READONLY);
+        cvars.set("*version", "hacked");
+        assert_eq!(cvars.string("*version"), "v1");
+
+        cvars.get("net_ip", "0.0.0.0", NOSET);
+        cvars.set("net_ip", "10.0.0.1");
+        assert_eq!(cvars.string("net_ip"), "10.0.0.1");
+        cvars.locked = true;
+        cvars.set("net_ip", "10.0.0.2");
+        assert_eq!(cvars.string("net_ip"), "10.0.0.1");
+        cvars.full_set("net_ip", "10.0.0.3", NOSET);
+        assert_eq!(cvars.string("net_ip"), "10.0.0.3");
+    }
+
+    #[test]
+    fn serverinfo_mirrors_flagged_cvars() {
+        let mut cvars = Cvars::default();
+        cvars.get("hostname", "unnamed", SERVERINFO);
+        cvars.get("developer", "0", 0);
+        assert_eq!(cvars.serverinfo, b"\\hostname\\unnamed");
+        cvars.set("hostname", "my proxy");
+        assert_eq!(cvars.serverinfo, b"\\hostname\\my proxy");
+    }
+
+    #[test]
+    fn take_modified_clears_flag() {
+        let mut cvars = Cvars::default();
+        cvars.get("masters", "a b", 0);
+        assert!(cvars.take_modified("masters"));
+        assert!(!cvars.take_modified("masters"));
+        cvars.mark_modified("masters");
+        assert!(cvars.take_modified("masters"));
+    }
 }
-
-/*
-============
-Cvar_FullSet
-============
- */
-cvar_t *Cvar_FullSet(const char *var_name, const char *value, int flags)
-{
-	cvar_t *var;
-
-	var = Cvar_Find(var_name);
-	if( !var )
-		return Cvar_Get(var_name, value, flags);
-
-	var->flags = flags;
-	return Cvar_ForceSet(var_name, value);
-}
-
-/*
-============
-Cvar_SetValue
-============
-*/
-cvar_t *Cvar_SetValue(const char *var_name, float value)
-{
-	char	val[32];
-
-	snprintf (val, sizeof (val), "%.8g", value);
-
-	return Cvar_Set(var_name, val);
-}
-
-/*
-===========
-Cvar_Create
-===========
-*/
-static cvar_t *Cvar_Create(const char *var_name, const char *value, int cvarflags)
-{
-	cvar_t		*v;
-	int			key;
-
-	v = Cvar_Find(var_name);
-	if (v)
-	{
-		Sys_DPrintf("Cvar_Create: cvar %s already exist, unexpected\n", var_name);
-		return v; // actually it should not happend
-	}
-
-	// Cvar doesn't exist, so we create it
-	v = (cvar_t *) Sys_malloc (sizeof(cvar_t));
-
-	// link it in
-	v->next = cvar_vars;
-	cvar_vars = v;
-	key = Key (var_name);
-	v->hash_next = cvar_hash[key];
-	cvar_hash[key] = v;
-
-	// set basic fields
-	v->name = Sys_strdup(var_name);
-	v->flags = cvarflags;
-
-	// now set it for real
-	Cvar_ForceSet(var_name, value);
-
-	return v;
-}
-
-/*
-===========
-Cvar_Delete
-===========
-returns true if the cvar was found (and deleted)
-*/
-
-static void Cvar_Free(cvar_t *var)
-{
-	Sys_free (var->string);
-	Sys_free (var->name);
-	Sys_free (var);
-}
-
-qbool Cvar_Delete (const char *var_name)
-{
-	cvar_t	*var, *prev;
-	int		key;
-
-	key = Key (var_name);
-
-	prev = NULL;
-	for (var = cvar_hash[key] ; var ; var=var->hash_next)
-	{
-		if (!stricmp(var->name, var_name))
-		{
-			// unlink from hash
-			if (prev)
-				prev->hash_next = var->next;
-			else
-				cvar_hash[key] = var->next;
-			break;
-		}
-		prev = var;
-	}
-
-	if (!var)
-		return false;
-
-	prev = NULL;
-	for (var = cvar_vars ; var ; var=var->next)
-	{
-		if (!stricmp(var->name, var_name))
-		{
-			// unlink from cvar list
-			if (prev)
-				prev->next = var->next;
-			else
-				cvar_vars = var->next;
-
-			// free
-			Cvar_Free(var);
-			return true;
-		}
-		prev = var;
-	}
-
-	Sys_Error ("Cvar list broken");
-	return false;	// shut up compiler
-}
-
-//===============================================================
-// Cvars commands
-//===============================================================
-
-/*
-============
-Cvar_Command
- 
-Handles variable inspection and changing from the console
-============
-*/
-qbool Cvar_Command (void)
-{
-	int			c;
-	cvar_t		*v;
-	char		string[1024];
-
-	// check variables
-	v = Cvar_Find (Cmd_Argv(0));
-	if (!v)
-		return false;
-
-	// perform a variable print or set
-	c = Cmd_Argc();
-
-	if (c < 1)
-		return false; // should not happend
-
-	if (c == 1)
-	{
-		Sys_Printf("\"%s\" is \"%s\"\n", v->name, v->string);
-		return true;
-	}
-
-	Cvar_Set (v->name, Cmd_Args_Range(1, c - 1, string, sizeof(string)));
-	return true;
-}
-
-/*
-=============
-Cvar_Toggle_f
-=============
-*/
-void Cvar_Toggle_f (void)
-{
-	cvar_t *var;
-
-	if (Cmd_Argc() != 2)
-	{
-		Sys_Printf("toggle <cvar> : toggle a cvar on/off\n");
-		return;
-	}
-
-	var = Cvar_Find (Cmd_Argv(1));
-	if (!var)
-	{
-		Sys_Printf("Unknown variable \"%s\"\n", Cmd_Argv(1));
-		return;
-	}
-
-	Cvar_Set (var->name, var->value ? "0" : "1");
-}
-
-/*
-===============
-Cvar_CvarList_f
-===============
-List all cvars
-TODO: allow cvar name mask as a parameter, e.g. cvarlist cl_*
-*/
-void Cvar_CvarList_f (void)
-{
-	cvar_t	*var;
-	int i;
-
-	for (var=cvar_vars, i=0 ; var ; var=var->next, i++)
-		Sys_Printf("%c%c %s\n",
-		           var->flags & CVAR_ARCHIVE    ? '*' : ' ',
-		           var->flags & CVAR_SERVERINFO ? 's' : ' ',
-		           var->name);
-
-	Sys_Printf("------------\n%d variables\n", i);
-}
-
-//DP_CON_SET
-void Cvar_Set_f (void)
-{
-	cvar_t *var;
-	char *var_name;
-	char string[1024];
-
-	if (Cmd_Argc() < 3)
-	{
-		Sys_Printf("usage: set <cvar> <value>\n");
-		return;
-	}
-
-	var_name = Cmd_Argv (1);
-	var = Cvar_Find (var_name);
-	Cmd_Args_Range(2, Cmd_Argc() - 1, string, sizeof(string));
-
-	if (var)
-	{
-		Cvar_Set (var_name, string);
-	}
-	else
-	{
-		var = Cvar_Create (var_name, string, CVAR_USER_CREATED);
-	}
-}
-
-void Cvar_Inc_f (void)
-{
-	int		c;
-	cvar_t	*var;
-	float	delta;
-
-	c = Cmd_Argc();
-	if (c != 2 && c != 3)
-	{
-		Sys_Printf("inc <cvar> [value]\n");
-		return;
-	}
-
-	var = Cvar_Find (Cmd_Argv(1));
-	if (!var)
-	{
-		Sys_Printf("Unknown variable \"%s\"\n", Cmd_Argv(1));
-		return;
-	}
-
-	if (c == 3)
-		delta = atof (Cmd_Argv(2));
-	else
-		delta = 1;
-
-	Cvar_SetValue (var->name, var->value + delta);
-}
-
-//#define CVAR_DEBUG
-#ifdef CVAR_DEBUG
-static void Cvar_Hash_Print_f (void)
-{
-	int		i, count;
-	cvar_t	*cvar;
-
-	Sys_Printf("Cvar hash:\n");
-	for (i = 0; i<32; i++)
-	{
-		count = 0;
-		for (cvar = cvar_hash[i]; cvar; cvar=cvar->hash_next, count++);
-			Sys_Printf("%i: %i\n", i, count);
-	}
-
-}
-#endif
-
-/*
-===============
-Cvar_DeInit
-===============
-Remove all cvars
-*/
-void Cvar_DeInit (void)
-{
-	cvar_t	*var, *next;
-
-	for (var = cvar_vars; var; var = next)
-	{
-		next = var->next;
-		Cvar_Free(var);
-	}
-
-	cvar_vars = NULL;
-}
-
-void Cvar_Init (void)
-{
-	Cmd_AddCommand ("cvarlist", Cvar_CvarList_f);
-	Cmd_AddCommand ("toggle", Cvar_Toggle_f);
-	Cmd_AddCommand ("set", Cvar_Set_f); //DP_CON_SET
-	Cmd_AddCommand ("inc", Cvar_Inc_f);
-
-#ifdef CVAR_DEBUG
-	Cmd_AddCommand ("cvar_hash_print", Cvar_Hash_Print_f);
-#endif
-}
-

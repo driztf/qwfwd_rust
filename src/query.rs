@@ -1,709 +1,436 @@
-/*
-	query.c - query master/normal qw servers
-*/
+//! Master server registration and the server list clients can query.
 
-#include "qwfwd.h"
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::time::{Duration, Instant};
 
-#define QW_SERVER_RATE (0.1) // seconds, accept fraction, how frequently sent ONE packet to some server, so 0.1 means one packet per 1/10 of second
-#define QW_SERVER_PING_QUERY "\xff\xff\xff\xffk\n"
-#define QW_SERVER_MIN_PING_REQUEST_TIME 60 // seconds, minimal time interval allowed to sent ping, so we do not spam server too fast
-#define QW_SERVER_DEAD_TIME (60 * 60) // seconds, if we do not get reply from server in this time, guess server is DEAD
+use tokio::net::UdpSocket;
 
+use crate::cmd::{self, Args};
+use crate::console::developer;
+use crate::cvar::Cvars;
+use crate::msg::{MSG_BUF_SIZE, MsgWriter};
+use crate::protocol::{A2C_PRINT, S2M_HEARTBEAT};
+use crate::proxy::Proxy;
+use crate::{cprint, dprint, net};
 
-#define QW_MASTER_QUERY "c\n"
-#define QW_MASTER_QUERY_TIME (60 * 30) // seconds, how frequently we query masters
-#define QW_MASTER_QUERY_TIME_SHORT 60 // seconds, how frequently we query master if we do not get reply from it yet
-#define QW_MASTERS_FORCE_RE_INIT (60 * 60 * 24) // seconds, force re-init masters time to time, so we add proper masters if there was some ip/dns changes
-#define QW_MASTER_HEARTBEAT_SECONDS (60 * 5) // seconds, frequency of heartbeat
+/// How often at most one server gets pinged.
+const SERVER_RATE: Duration = Duration::from_millis(100);
+const SERVER_PING_QUERY: &[u8] = b"\xff\xff\xff\xffk\n";
+/// Minimum interval between pings of the same server.
+const SERVER_MIN_PING_INTERVAL: Duration = Duration::from_secs(60);
+/// A server that stays silent this long is forgotten.
+const SERVER_DEAD_TIME: Duration = Duration::from_secs(60 * 60);
 
-#define QW_DEFAULT_MASTER_SERVERS "master.quakeworld.nu qwmaster.fodquake.net master.quakeservers.net"
-#define QW_DEFAULT_MASTER_SERVER_PORT 27000
+/// Sent with its NUL terminator, as the original did.
+const MASTER_QUERY: &[u8] = b"c\n\0";
+const MASTER_QUERY_INTERVAL: Duration = Duration::from_secs(60 * 30);
+/// Retry interval while a master has not answered yet.
+const MASTER_QUERY_RETRY: Duration = Duration::from_secs(60);
+/// Masters are re-resolved this often so DNS changes get picked up.
+const MASTERS_REINIT_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24);
+const MASTER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60 * 5);
 
-#define MAX_MASTERS 8 // size for masters fixed size array, I am lazy
+const DEFAULT_MASTER_SERVERS: &str =
+    "master.quakeworld.nu qwmaster.fodquake.net master.quakeservers.net";
+const DEFAULT_MASTER_PORT: u16 = 27000;
+/// Some masters list unusable servers; filter them out by default.
+const DEFAULT_SERVER_FILTER: &str = "127.0.0.1";
 
-#define MAX_SERVERS 512 // we will not add more than that servers to our list, just for some sanity
+const MAX_MASTERS: usize = 8;
+const MAX_SERVERS: usize = 512;
+const MAX_FILTERS: usize = 16;
 
-#define MAX_SV_FILTERS 16 // how much servers we can filter with masters_filter_servers, can be increased widely.
-#define QW_DEFAULT_SV_FILTER "127.0.0.1" // some masters provide unusable servers, filter them.
+const UNREACHABLE_PING: i32 = 0xFFFF;
 
-static cvar_t *masters_query;
-static cvar_t *masters_heartbeat;
-static cvar_t *masters_list;
-static cvar_t *masters_filter_servers;
-
-// master state enum
-typedef enum
-{
-	ms_unknown,		// unknown state
-	ms_used			// this slot used in masters_t struct
-} master_state_t;
-
-// single master struct
-typedef struct master
-{
-	master_state_t			state;		// master state
-	time_t					next_query;	// next time when query master server
-	struct sockaddr_in		addr;		// master addr
-} master_t;
-
-// all masters in one struct
-typedef struct masters
-{
-	time_t					init_time;				// this is used to periodical re-init initiation
-
-	time_t					last_heartbeat;			// when we send heartbeat last time
-	int						heartbeat_sequence;		// heartbeat sequence number
-
-	master_t				master[MAX_MASTERS];	// masters fixed size array, I am lazy
-} masters_t;
-
-// single server struct
-typedef struct server
-{
-	struct sockaddr_in		addr;			// addr
-
-	qbool					reply;			// true if we get reply after ping packet was sent,
-											// reset to false each time we sent packet
-	double					ping_sent_at;	// last time when we send ping request, so we can calculate ping time
-	double					ping_reply_at;	// last time when we receive ping reply from server,
-											// so we can guess is server dead etc
-	int						ping;			// ping to that server in milliseconds
-
-	struct server			*next;			// next server in linked list
-} server_t;
-
-// single server_filter struct.
-// used by masters_filter_servers.
-typedef struct server_filter
-{
-	struct sockaddr_in		addr[MAX_SV_FILTERS];			// addr[]
-	int						count;
-} server_filter_t;
-
-static int sv_count;
-static server_t *servers;
-static server_filter_t server_filter;
-static masters_t masters;
-
-static master_t	*QRY_Master_ByAddr(struct sockaddr_in *addr)
-{
-	int						i;
-	master_t				*m;
-
-	for (i = 0, m = masters.master; i < MAX_MASTERS; i++, m++)
-	{
-		if (m->state != ms_used)
-			continue; // master slot unused
-
-		if (NET_CompareAddress(addr, &m->addr))
-			return m;
-	}
-
-	return NULL;
+struct Master {
+    addr: SocketAddrV4,
+    next_query: Instant,
 }
 
-static qbool QRY_AddMaster(const char *master)
-{
-	int						i, port;
-	master_t				*m;
-	struct sockaddr_in		addr;
-	char					host[1024], *column;
-
-	// decide host:port, port is optional and DEFAULT_MASTER_SERVER_PORT is used if ommited
-	port = 0;
-	strlcpy(host, master, sizeof(host));
-	if ((column = strchr(host, ':')))
-	{
-		column[0] = 0; // truncate host name
-		port = atoi(column + 1); // get port for real
-	}
-	port = (port > 0 && port < 65535) ? port : QW_DEFAULT_MASTER_SERVER_PORT;
-
-	if (!host[0])
-	{
-		Sys_Printf("failed to add master server: %s\n", master);
-		return false; // empty host name, not funny
-	}
-
-	if (!NET_GetSockAddrIn_ByHostAndPort(&addr, host, port))
-	{
-		Sys_Printf("failed to add master server: %s\n", master);
-		return false;
-	}
-
-	if (QRY_Master_ByAddr(&addr))
-	{
-		Sys_Printf("failed to add master server: %s - already added!\n", master);
-		return false;
-	}
-
-	for (i = 0, m = masters.master; i < MAX_MASTERS; i++, m++)
-	{
-		if (m->state == ms_used)
-			continue; // master slot used
-
-		memset(m, 0, sizeof(*m)); // reset data in slot
-
-		m->state = ms_used;
-		m->addr = addr;
-
-		Sys_Printf("master server added: %s\n", master);
-		return true;
-	}
-
-	Sys_Printf("failed to add master server: %s\n", master);
-	return false;
+struct Server {
+    addr: SocketAddrV4,
+    /// Whether the last ping was answered.
+    reply: bool,
+    ping_sent_at: Option<Instant>,
+    ping_reply_at: Option<Instant>,
+    ping: i32,
 }
 
-static void QRY_Cmd_Heartbeat_f(void)
-{
-	masters.last_heartbeat = time(NULL) - QW_MASTER_HEARTBEAT_SECONDS - 1; // trigger heartbeat ASAP
+pub struct Query {
+    /// Stands in for "never" when computing server liveness.
+    epoch: Instant,
+    masters: Vec<Master>,
+    masters_init_at: Instant,
+    next_heartbeat: Instant,
+    heartbeat_sequence: i32,
+    servers: Vec<Server>,
+    filters: Vec<Ipv4Addr>,
+    ping_index: usize,
+    last_ping_at: Option<Instant>,
 }
 
-// clear masters
-static void QRY_MastersInit(void)
-{
-	memset(&masters, 0, sizeof(masters));
-	masters.init_time = time(NULL);
+impl Query {
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Query {
+            epoch: now,
+            masters: Vec::new(),
+            masters_init_at: now,
+            next_heartbeat: now,
+            heartbeat_sequence: 0,
+            servers: Vec::new(),
+            filters: Vec::new(),
+            ping_index: 0,
+            last_ping_at: None,
+        }
+    }
 
-	QRY_Cmd_Heartbeat_f();  // trigger heartbeat ASAP
+    pub fn register_cvars(cvars: &mut Cvars) {
+        cvars.get("masters_query", "1", 0);
+        cvars.get("masters_heartbeat", "1", 0);
+        cvars.get("masters", DEFAULT_MASTER_SERVERS, 0);
+        cvars.get("masters_filter_servers", DEFAULT_SERVER_FILTER, 0);
+    }
+
+    pub async fn frame(&mut self, cvars: &mut Cvars, socket: &UdpSocket, peer_count: usize) {
+        self.check_filters_modified(cvars).await;
+        self.check_masters_modified(cvars).await;
+        self.query_masters(cvars, socket);
+        self.heartbeat_masters(cvars, socket, peer_count);
+        self.ping_servers(cvars, socket);
+    }
+
+    /// Whether a packet from the proxy socket is a master server list reply.
+    pub fn is_master_reply(data: &[u8]) -> bool {
+        data.starts_with(b"\xff\xff\xff\xffd\n")
+    }
+
+    fn reset_masters(&mut self) {
+        self.masters.clear();
+        self.masters_init_at = Instant::now();
+        self.heartbeat_sequence = 0;
+        self.trigger_heartbeat();
+    }
+
+    fn trigger_heartbeat(&mut self) {
+        self.next_heartbeat = Instant::now();
+    }
+
+    fn master_by_addr(&mut self, addr: SocketAddrV4) -> Option<&mut Master> {
+        self.masters.iter_mut().find(|m| m.addr == addr)
+    }
+
+    async fn add_master(&mut self, spec: &str) -> bool {
+        let (host, port) = match spec.split_once(':') {
+            Some((host, port)) => (host, crate::parse::atoi(port.as_bytes())),
+            None => (spec, 0),
+        };
+        let port = u16::try_from(port)
+            .ok()
+            .filter(|&p| p > 0 && p < 65535)
+            .unwrap_or(DEFAULT_MASTER_PORT);
+
+        if host.is_empty() {
+            cprint!("failed to add master server: {spec}\n");
+            return false;
+        }
+        let Some(addr) = net::resolve(host, port).await else {
+            cprint!("failed to add master server: {spec}\n");
+            return false;
+        };
+        if self.master_by_addr(addr).is_some() {
+            cprint!("failed to add master server: {spec} - already added!\n");
+            return false;
+        }
+        if self.masters.len() >= MAX_MASTERS {
+            cprint!("failed to add master server: {spec}\n");
+            return false;
+        }
+
+        self.masters.push(Master {
+            addr,
+            next_query: Instant::now(),
+        });
+        cprint!("master server added: {spec}\n");
+        true
+    }
+
+    async fn check_masters_modified(&mut self, cvars: &mut Cvars) {
+        if self.masters_init_at.elapsed() > MASTERS_REINIT_INTERVAL {
+            dprint!("forcing masters re-init\n");
+            cvars.mark_modified("masters");
+        }
+        let masters_changed = cvars.take_modified("masters");
+        let query_changed = cvars.take_modified("masters_query");
+        if !masters_changed && !query_changed {
+            return;
+        }
+
+        self.reset_masters();
+        for spec in cmd::tokens(cvars.string("masters")) {
+            self.add_master(&spec).await;
+        }
+    }
+
+    fn query_masters(&mut self, cvars: &Cvars, socket: &UdpSocket) {
+        if cvars.int("masters_query") == 0 {
+            return;
+        }
+        let now = Instant::now();
+        for master in &mut self.masters {
+            if now < master.next_query {
+                continue;
+            }
+            dprint!("query master: {}\n", master.addr);
+            net::send(socket, MASTER_QUERY, master.addr);
+            master.next_query = now + MASTER_QUERY_RETRY;
+        }
+    }
+
+    fn heartbeat_masters(&mut self, cvars: &Cvars, socket: &UdpSocket, peer_count: usize) {
+        if cvars.int("masters_heartbeat") == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.next_heartbeat {
+            return;
+        }
+        self.next_heartbeat = now + MASTER_HEARTBEAT_INTERVAL;
+        self.heartbeat_sequence += 1;
+
+        let heartbeat = format!(
+            "{}\n{}\n{}\n",
+            S2M_HEARTBEAT as char, self.heartbeat_sequence, peer_count
+        );
+        if developer() > 1 {
+            dprint!("heartbeat:\n{heartbeat}\n");
+        }
+        for master in &self.masters {
+            dprint!("heartbeat master: {}\n", master.addr);
+            net::send(socket, heartbeat.as_bytes(), master.addr);
+        }
+    }
+
+    pub fn parse_master_reply(&mut self, cvars: &Cvars, from: SocketAddrV4, data: &[u8]) {
+        if cvars.int("masters_query") == 0 {
+            dprint!("master server reply ignored\n");
+            return;
+        }
+        dprint!("master server reply from {from}\n");
+
+        let Some(master) = self.master_by_addr(from) else {
+            cprint!("Reply from not registered master server\n");
+            return;
+        };
+        master.next_query = Instant::now() + MASTER_QUERY_INTERVAL;
+        dprint!("master server returned {} bytes\n", data.len());
+
+        for (i, entry) in data[6..].as_chunks::<6>().0.iter().enumerate() {
+            let addr = SocketAddrV4::new(
+                Ipv4Addr::new(entry[0], entry[1], entry[2], entry[3]),
+                u16::from_be_bytes([entry[4], entry[5]]),
+            );
+            if developer() > 1 {
+                dprint!("SERVER: {i:4} {addr}\n");
+            }
+            self.add_server(addr);
+        }
+    }
+
+    fn add_server(&mut self, addr: SocketAddrV4) {
+        if self.servers.len() >= MAX_SERVERS || self.servers.iter().any(|s| s.addr == addr) {
+            return;
+        }
+        if self.filters.contains(addr.ip()) {
+            dprint!("filtered: {addr}\n");
+            return;
+        }
+        self.servers.push(Server {
+            addr,
+            reply: false,
+            ping_sent_at: None,
+            ping_reply_at: None,
+            ping: UNREACHABLE_PING,
+        });
+    }
+
+    /// Pings one server per call, cycling through the list at a gentle rate.
+    fn ping_servers(&mut self, cvars: &Cvars, socket: &UdpSocket) {
+        if cvars.int("masters_query") == 0 || self.servers.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_ping_at
+            .is_some_and(|last| now.duration_since(last) < SERVER_RATE)
+        {
+            return;
+        }
+        self.last_ping_at = Some(now);
+
+        let index = if self.ping_index < self.servers.len() {
+            self.ping_index
+        } else {
+            0
+        };
+        self.ping_index = index + 1;
+        let server = &mut self.servers[index];
+
+        let sent = server.ping_sent_at.unwrap_or(self.epoch);
+        let replied = server.ping_reply_at.unwrap_or(self.epoch);
+        if !server.reply && sent.saturating_duration_since(replied) > SERVER_DEAD_TIME {
+            dprint!("dead -> {}\n", server.addr);
+            self.servers.remove(index);
+            self.ping_index = index;
+            return;
+        }
+
+        if server
+            .ping_sent_at
+            .is_some_and(|sent| now.duration_since(sent) < SERVER_MIN_PING_INTERVAL)
+        {
+            return;
+        }
+        server.ping_sent_at = Some(now);
+        server.reply = false;
+        net::send(socket, SERVER_PING_QUERY, server.addr);
+    }
+
+    pub fn ping_reply(&mut self, cvars: &Cvars, from: SocketAddrV4) {
+        if cvars.int("masters_query") == 0 {
+            dprint!("server reply ignored\n");
+            return;
+        }
+        let epoch = self.epoch;
+        if let Some(server) = self.servers.iter_mut().find(|s| s.addr == from) {
+            let now = Instant::now();
+            let sent = server.ping_sent_at.unwrap_or(epoch);
+            server.ping = now.saturating_duration_since(sent).as_millis() as i32;
+            server.ping_reply_at = Some(now);
+            server.reply = true;
+        }
+    }
+
+    /// Answers a `pingstatus` query with every known server and its ping.
+    pub fn ping_status(&self, cvars: &Cvars, socket: &UdpSocket, from: SocketAddrV4) {
+        let mut msg = MsgWriter::out_of_band(MSG_BUF_SIZE);
+        msg.write_byte(A2C_PRINT);
+
+        // Without master queries the list would be stale, so send none.
+        if cvars.int("masters_query") != 0 {
+            for server in &self.servers {
+                msg.write(&server.addr.ip().octets());
+                msg.write_short(server.addr.port() as i16);
+                msg.write_short(server.ping as i16);
+            }
+        }
+
+        if msg.overflowed() {
+            cprint!("SVC_QRY_PingStatus: overflow\n");
+            return;
+        }
+        net::send(socket, msg.as_bytes(), from);
+    }
+
+    async fn add_filter(&mut self, spec: &str) -> bool {
+        if self.filters.len() >= MAX_FILTERS {
+            cprint!("failed to add server filter: {spec} - filter list are full!\n");
+            return false;
+        }
+        let host = spec.split_once(':').map_or(spec, |(host, _)| host);
+        if host.is_empty() {
+            cprint!("failed to add server filter: {spec}\n");
+            return false;
+        }
+        let Some(addr) = net::resolve(host, 0).await else {
+            cprint!("failed to add server filter: {spec}\n");
+            return false;
+        };
+        if self.filters.contains(addr.ip()) {
+            cprint!("failed to add server filter: {spec} - already added!\n");
+            return false;
+        }
+        self.filters.push(*addr.ip());
+        cprint!("server filter added: {spec}\n");
+        true
+    }
+
+    async fn check_filters_modified(&mut self, cvars: &mut Cvars) {
+        if !cvars.take_modified("masters_filter_servers") {
+            return;
+        }
+        self.filters.clear();
+        for spec in cmd::tokens(cvars.string("masters_filter_servers")) {
+            self.add_filter(&spec).await;
+        }
+        let filters = &self.filters;
+        self.servers.retain(|s| {
+            let filtered = filters.contains(s.addr.ip());
+            if filtered {
+                dprint!("filtered: {}\n", s.addr);
+            }
+            !filtered
+        });
+    }
 }
 
-// check if "masters" or "masters_query" cvar changed and do appropriate action
-static void QRY_CheckMastersModified(void)
-{
-	char *mlist;
-
-	// for fix issues with DNS and such force masters re-init time to time
-	if (time(NULL) - masters.init_time > QW_MASTERS_FORCE_RE_INIT)
-	{
-		Sys_DPrintf("forcing masters re-init\n");
-		masters_list->modified = true;
-	}
-
-	// "masters" and "masters_query" was not modified, do nothing
-	if (!masters_list->modified && !masters_query->modified)
-		return;
-
-	// clear masters
-	QRY_MastersInit();
-
-	// add all masters
-	for ( mlist = masters_list->string; (mlist = COM_Parse(mlist)); )
-	{
-		QRY_AddMaster(com_token);
-	}
-
-	masters_list->modified = masters_query->modified = false;
+impl Proxy {
+    pub fn register_query_commands(&mut self) {
+        self.cmds.register("svlist", cmd_svlist);
+        self.cmds.register("heartbeat", cmd_heartbeat);
+    }
 }
 
-// query master servers
-static void QRY_QueryMasters(void)
-{
-	int			i;
-	master_t	*m;
-	time_t		current_time = time(NULL);
-	char		buf[] = "xxx.xxx.xxx.xxx:xxxxx";
-
-	// do we need query masters?
-	if (!masters_query->integer)
-		return;
-
-	for (i = 0, m = masters.master; i < MAX_MASTERS; i++, m++)
-	{
-		if (m->state != ms_used)
-			continue; // master slot not used
-
-		if (current_time <= m->next_query)
-			continue; // not yet
-
-		Sys_DPrintf("query master: %s\n", NET_AdrToString(&m->addr, buf, sizeof(buf)));
-		
-		NET_SendPacket(net_socket, sizeof(QW_MASTER_QUERY), QW_MASTER_QUERY, &m->addr);
-		m->next_query = current_time + QW_MASTER_QUERY_TIME_SHORT; // delay next query for some time
-	}
+fn cmd_svlist(proxy: &mut Proxy, _args: &Args) {
+    cprint!("=== server list ===\n");
+    cprint!("### {:<21} ping\n", "address");
+    cprint!("--------------------------------------\n");
+    for (i, server) in proxy.query.servers.iter().enumerate() {
+        cprint!("{:3} {:<21} {}\n", i + 1, server.addr, server.ping);
+    }
+    cprint!("--------------------------------------\n");
+    cprint!("{} servers\n", proxy.query.servers.len());
 }
 
-// heartbeat master servers.
-// send a message to the master every few minutes.
-static void QRY_HeartbeatMasters(void)
-{
-	char		string[128];
-	int			i, len;
-	master_t	*m;
-	time_t		current_time = time(NULL);
-	char		buf[] = "xxx.xxx.xxx.xxx:xxxxx";
-
-	// do we need heartbeat masters?
-	if (!masters_heartbeat->integer)
-		return;
-
-	if (current_time < masters.last_heartbeat + QW_MASTER_HEARTBEAT_SECONDS)
-		return; // not yet
-	
-	masters.last_heartbeat = current_time;
-	masters.heartbeat_sequence++;
-	snprintf(string, sizeof(string), "%c\n%i\n%i\n", S2M_HEARTBEAT, masters.heartbeat_sequence, FWD_peers_count());
-	len = strlen(string);
-
-	if (developer->integer > 1)
-		Sys_DPrintf("heartbeat:\n%s\n", string);
-
-	for (i = 0, m = masters.master; i < MAX_MASTERS; i++, m++)
-	{
-		if (m->state != ms_used)
-			continue; // master slot not used
-		
-		Sys_DPrintf("heartbeat master: %s\n", NET_AdrToString(&m->addr, buf, sizeof(buf)));
-		NET_SendPacket(net_socket, len, string, &m->addr);
-	}
+fn cmd_heartbeat(proxy: &mut Proxy, _args: &Args) {
+    proxy.query.trigger_heartbeat();
 }
 
-qbool QRY_IsMasterReply(void)
-{
-	if (net_message.cursize < 6 || memcmp(net_message.data, "\xff\xff\xff\xff\x64\x0a", 6))
-		return false;
-
-	return true;
-}
-
-static server_t	*QRY_SV_new(const char *remote_host, int remote_port, qbool link); // forward reference
-
-void SVC_QRY_ParseMasterReply(void)
-{
-    int				i, c;
-	master_t		*m;
-	int				ret = net_message.cursize;
-	unsigned char	*answer = net_message.data; // not the smartest way, but why copy from one place to another...
-
-	// no point to parse it, we do not query masters
-	if (!masters_query->integer)
-	{
-		Sys_DPrintf("master server reply ignored\n");
-		return;
-	}
-
-	Sys_DPrintf ("master server reply from %s:%d\n", inet_ntoa(net_from.sin_addr), (int)ntohs(net_from.sin_port));
-
-	// is it reply from registered master server or someone trying to do some evil things?
-	for (i = 0, m = masters.master; i < MAX_MASTERS; i++, m++)
-	{
-		if (m->state != ms_used)
-			continue; // master slot not used
-
-		if (NET_CompareAddress(&net_from, &m->addr))
-		{
-			// OK - it is reply from registered master server
-			m->next_query = time(NULL) + QW_MASTER_QUERY_TIME; // delay next query for some time
-			break;
-		}
-	}
-
-	if (i >= MAX_MASTERS)
-	{
-		Sys_Printf("Reply from not registered master server\n");
-		return;
-	}
-
-	Sys_DPrintf("master server returned %d bytes\n", ret);
-
-	for (c = 0, i = 6; i + 5 < ret; i += 6, c++)
-	{
-		char ip[64];
-		int port = 256 * (int)answer[i+4] + (int)answer[i+5];
-
-		snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
-			(int)answer[i+0], (int)answer[i+1],
-			(int)answer[i+2], (int)answer[i+3]);
-
-		if (developer->integer > 1)
-			Sys_DPrintf("SERVER: %4d %s:%d\n", c, ip, port);
-
-		QRY_SV_new(ip, port, true);
-	}
-}
-
-//========================================
-
-static struct sockaddr_in *QRY_FL_Filtered(struct sockaddr_in *addr); // forward reference
-
-static int QRY_SV_Count(void)
-{
-	return sv_count;
-}
-
-// return server by pseudo index
-static server_t	*QRY_SV_ByIndex(int idx)
-{
-	server_t	*sv;
-
-	if (idx < 0)
-		return NULL;
-
-	for (sv = servers; sv; sv = sv->next, idx--)
-		if (!idx)
-			return sv;
-
-	return NULL;
-}
-
-static server_t	*QRY_SV_ByAddrEx(struct sockaddr_in *addr, qbool base)
-{
-	// use different compare function.
-	typedef		qbool (*net_cmp_func)(struct sockaddr_in *a, struct sockaddr_in *b);
-	net_cmp_func cmp_func = base ? NET_CompareBaseAddress : NET_CompareAddress;
-
-	server_t	*sv;
-
-	for (sv = servers; sv; sv = sv->next)
-		if ((*cmp_func)(addr, &sv->addr))
-			return sv;
-
-	return NULL;
-}
-
-static server_t	*QRY_SV_ByAddr(struct sockaddr_in *addr)
-{
-	return QRY_SV_ByAddrEx(addr, false);
-}
-
-static server_t	*QRY_SV_new(const char *remote_host, int remote_port, qbool link)
-{
-	server_t			*sv;
-	struct sockaddr_in	addr;
-
-	if (QRY_SV_Count() >= MAX_SERVERS)
-		return NULL;
-
-	if (!NET_GetSockAddrIn_ByHostAndPort(&addr, remote_host, remote_port))
-		return NULL; // failed to resolve host name?
-
-	if ((sv = QRY_SV_ByAddr(&addr)))
-		return NULL; // we already have such server on list
-
-	if (QRY_FL_Filtered(&addr))
-	{
-		char buf[] = "xxx.xxx.xxx.xxx:xxxxx";
-		Sys_DPrintf("filtered: %s\n", NET_AdrToString(&addr, buf, sizeof(buf)));
-		return NULL; // filtered
-	}
-
-	sv_count++;
-
-	sv = Sys_malloc(sizeof(*sv));
-	sv->addr = addr;
-	sv->ping = 0xFFFF; // mark as unreachable
-
-	if (link)
-	{
-		sv->next = servers;
-		servers = sv;
-	}
-
-	return sv;
-}
-
-// free server data, perform unlink if requested
-static void QRY_SV_free(server_t *sv, qbool unlink)
-{
-	if (!sv)
-		return;
-
-	if (unlink)
-	{
-		server_t *next, *prev, *current;
-
-		prev = NULL;
-		current = servers;
-
-		for ( ; current; )
-		{
-			next = current->next;
-
-			if (sv == current)
-			{
-				if (prev)
-					prev->next = next;
-				else
-					servers = next;
-
-				break;
-			}
-
-			prev = current;
-			current = next;
-		}
-	}
-
-	// free all data related to server
-	Sys_free(sv);
-
-	sv_count--;
-}
-
-static void QRY_SV_PingServers(void)
-{
-	static int		idx;
-	static double	last;
-
-	double			current = Sys_DoubleTime(); // we need double time for ping measurement
-	server_t		*sv;
-
-	// do not ping servers since we do not query masters
-	if (!masters_query->integer)
-		return;
-
-	if (!servers)
-		return; // nothing to do
-
-	if (current - last < QW_SERVER_RATE)
-		return; // do not ping servers too fast
-
-	last = current;
-
-	idx = (int)max(0, idx);
-	sv = QRY_SV_ByIndex(idx++);
-	if (!sv)
-		sv = QRY_SV_ByIndex(idx = 0); // can't find server by index, try with index 0
-
-	if (!sv)
-		return; // hm, should not be the case...
-
-	// check for dead server
-	if (!sv->reply && sv->ping_sent_at - sv->ping_reply_at > QW_SERVER_DEAD_TIME)
-	{
-		Sys_DPrintf("dead -> %s:%d\n", inet_ntoa(sv->addr.sin_addr), (int)ntohs(sv->addr.sin_port));
-
-		QRY_SV_free(sv, true); // remove damn server, however master server may add it back...
-		idx--; // step back index
-		return;
-	}
-
-	if (sv->ping_sent_at && current - sv->ping_sent_at < QW_SERVER_MIN_PING_REQUEST_TIME)
-		return; // do not spam server
-
-	sv->ping_sent_at = current; // remember when we sent ping
-	sv->reply = false; // reset reply flag
-
-	NET_SendPacket(net_socket, sizeof(QW_SERVER_PING_QUERY)-1, QW_SERVER_PING_QUERY, &sv->addr);
-//	Sys_Printf("ping(%3d) -> %s:%d\n", idx, inet_ntoa(sv->addr.sin_addr), (int)ntohs(sv->addr.sin_port));
-}
-
-void QRY_SV_PingReply(void)
-{
-	server_t *sv = NULL;
-
-	// ignore server ping reply since we do not query masters and can't keep server list up2date
-	if (!masters_query->integer)
-	{
-		Sys_DPrintf("server reply ignored\n");
-		return;
-	}
-
-	sv = QRY_SV_ByAddr(&net_from);
-
-	if (sv)
-	{
-		double current = Sys_DoubleTime();
-		double ping = current - sv->ping_sent_at;
-
-		sv->ping = (int)max(0, 1000.0 * ping);
-		sv->ping_reply_at = current;
-		sv->reply = true;
-
-//		Sys_Printf("ping <- %s:%d, %d\n", inet_ntoa(net_from.sin_addr), (int)ntohs(net_from.sin_port), sv->ping);
-	}
-	else
-	{
-//		Sys_Printf("ping <- %s:%d, not registered server\n", inet_ntoa(net_from.sin_addr), (int)ntohs(net_from.sin_port));
-	}
-}
-
-void SVC_QRY_PingStatus(void)
-{
-	static sizebuf_t buf; // static  - so it not allocated each time
-	static byte		buf_data[MSG_BUF_SIZE]; // static  - so it not allocated each time
-
-	server_t		*sv;
-
-	SZ_InitEx(&buf, buf_data, sizeof(buf_data), true);
-
-	MSG_WriteLong(&buf, -1);	// -1 sequence means out of band
-	MSG_WriteChar(&buf, A2C_PRINT);
-
-	// if we does not query masters then we can't proved reliable info, so do not send servers list
-	if (masters_query->integer)
-	{
-		for (sv = servers; sv; sv = sv->next)
-		{
-			MSG_WriteLong(&buf, *(int *)&sv->addr.sin_addr);
-			MSG_WriteShort(&buf, (short)ntohs(sv->addr.sin_port));
-			MSG_WriteShort(&buf, (short)sv->ping);
-		}
-	}
-
-	if (buf.overflowed)
-	{
-		Sys_Printf("SVC_QRY_PingStatus: overflow\n");
-		return; // overflowed
-	}
-
-	// send the datagram
-	NET_SendPacket(net_from_socket, buf.cursize, buf.data, &net_from);
-}
-
-//==============================================
-// server filters.
-// _FL_ stands for filter.
-
-static void QRY_FL_Init(void)
-{
-	memset(&server_filter, 0, sizeof(server_filter));
-}
-
-static struct sockaddr_in *QRY_FL_Filtered(struct sockaddr_in *addr)
-{
-	int						i;
-
-	for (i = 0; i < server_filter.count; i++)
-	{
-		if (NET_CompareBaseAddress(addr, &server_filter.addr[i]))
-			return &server_filter.addr[i];
-	}
-
-	return NULL;
-}
-
-static qbool QRY_FL_AddFilter(const char *filter)
-{
-	struct sockaddr_in		addr;
-	char					host[1024], *column;
-
-	if (server_filter.count >= MAX_SV_FILTERS)
-	{
-		Sys_Printf("failed to add server filter: %s - filter list are full!\n", filter);
-		return false;
-	}
-
-	// get host name.
-	strlcpy(host, filter, sizeof(host));
-	if ((column = strchr(host, ':')))
-	{
-		column[0] = 0; // get rid of port.
-	}
-
-	if (!host[0])
-	{
-		Sys_Printf("failed to add server filter: %s\n", filter);
-		return false; // empty host name, not funny
-	}
-
-	if (!NET_GetSockAddrIn_ByHostAndPort(&addr, host, 0))
-	{
-		Sys_Printf("failed to add server filter: %s\n", filter);
-		return false;
-	}
-
-	if (QRY_FL_Filtered(&addr))
-	{
-		Sys_Printf("failed to add server filter: %s - already added!\n", filter);
-		return false;
-	}
-
-	server_filter.addr[server_filter.count] = addr;
-	server_filter.count++;
-
-	Sys_Printf("server filter added: %s\n", filter);
-	return true;
-}
-
-static void QRY_FL_RemoveFilteredServers(void)
-{
-	int			i;
-	server_t	*sv;
-
-	for (i = 0; i < server_filter.count; i++)
-	{
-		if ((sv = QRY_SV_ByAddrEx(&server_filter.addr[i], true)))
-		{
-			char buf[] = "xxx.xxx.xxx.xxx:xxxxx";
-			Sys_DPrintf("filtered: %s\n", NET_AdrToString(&sv->addr, buf, sizeof(buf)));
-			QRY_SV_free(sv, true);
-		}
-	}
-}
-
-// check if "masters_filter_servers" cvar changed and do appropriate action
-static void QRY_FL_CheckVarsModified(void)
-{
-	char *mlist;
-
-	// "masters_filter_servers" was not modified, do nothing
-	if (!masters_filter_servers->modified)
-		return;
-
-	// clear filters
-	QRY_FL_Init();
-
-	// add all filters
-	for ( mlist = masters_filter_servers->string; (mlist = COM_Parse(mlist)); )
-	{
-		QRY_FL_AddFilter(com_token);
-	}
-
-	// remove filtered servers if any.
-	QRY_FL_RemoveFilteredServers();
-
-	masters_filter_servers->modified = false;
-}
-
-//==============================================
-
-static void QRY_Cmd_SvList_f(void)
-{
-	server_t	*sv;
-	int idx;
-	char ipport[] = "xxx.xxx.xxx.xxx:xxxxx";
-
-	Sys_Printf("=== server list ===\n");
-	Sys_Printf("### %-*s ping\n", sizeof(ipport)-1, "address");
-	Sys_Printf("--------------------------------------\n");
-
-	for (idx = 1, sv = servers; sv; sv = sv->next, idx++)
-	{
-		Sys_Printf("%3d %-*s %d\n",
-			idx, sizeof(ipport)-1, NET_AdrToString(&sv->addr, ipport, sizeof(ipport)), (int)sv->ping);
-	}
-
-	Sys_Printf("--------------------------------------\n");
-	Sys_Printf("%d servers\n", idx-1);
-}
-
-//==============================================
-
-void QRY_Frame(void)
-{
-	QRY_FL_CheckVarsModified();		// check if "masters_filter_servers" variable changed
-	QRY_CheckMastersModified();		// check is "masters" variable changed
-	QRY_QueryMasters();				// request time to time server list from masters
-	QRY_HeartbeatMasters();			// send heartbeat to masters time to time
-	QRY_SV_PingServers();			// ping time to time normal qw servers
-}
-
-//==============================================
-
-void QRY_Init(void)
-{
-	masters_query		= Cvar_Get("masters_query",		"1", 0);
-	masters_heartbeat	= Cvar_Get("masters_heartbeat",	"1", 0);
-	masters_list		= Cvar_Get("masters",			QW_DEFAULT_MASTER_SERVERS, 0);
-	masters_filter_servers = Cvar_Get("masters_filter_servers",	QW_DEFAULT_SV_FILTER, 0);
-
-	Cmd_AddCommand("svlist", QRY_Cmd_SvList_f);
-	Cmd_AddCommand("heartbeat", QRY_Cmd_Heartbeat_f);
-
-	// clear filters
-	QRY_FL_Init();
-	// clear masters
-	QRY_MastersInit();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_master_replies() {
+        assert!(Query::is_master_reply(
+            b"\xff\xff\xff\xffd\n\x01\x02\x03\x04\x6b\x6c"
+        ));
+        assert!(!Query::is_master_reply(b"\xff\xff\xff\xffn"));
+        assert!(!Query::is_master_reply(b"\xff\xff\xff\xffd"));
+    }
+
+    #[test]
+    fn master_reply_adds_servers_from_registered_masters_only() {
+        let mut cvars = Cvars::default();
+        Query::register_cvars(&mut cvars);
+        let mut query = Query::new();
+        let master = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 27000);
+        query.filters.push(Ipv4Addr::new(127, 0, 0, 1));
+
+        let reply = b"\xff\xff\xff\xffd\n\x0a\x00\x00\x02\x6b\x6c\x7f\x00\x00\x01\x6b\x6c\x0a\x00\x00\x02\x6b\x6c\xff";
+        query.parse_master_reply(&cvars, master, reply);
+        assert!(query.servers.is_empty());
+
+        query.masters.push(Master {
+            addr: master,
+            next_query: Instant::now(),
+        });
+        query.parse_master_reply(&cvars, master, reply);
+        assert_eq!(query.servers.len(), 1);
+        assert_eq!(
+            query.servers[0].addr,
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 27500)
+        );
+        assert!(query.masters[0].next_query > Instant::now() + Duration::from_secs(60));
+    }
 }

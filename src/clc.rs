@@ -1,227 +1,159 @@
-/*
-	cmd.c
-*/
+//! Client-side handling of connectionless packets from remote servers: the
+//! proxy plays the client while completing the handshake on a peer's behalf.
 
-#include "qwfwd.h"
+use crate::cmd::Args;
+use crate::console::qstr;
+use crate::msg::{MsgReader, MsgWriter};
+use crate::peer::{Peer, PeerState, Protocol};
+use crate::protocol::{
+    A2C_CLIENT_COMMAND, A2C_PRINT, QW_PROTOCOL_VERSION, S2C_CHALLENGE, S2C_CONNECTION,
+    SVC_DISCONNECT,
+};
+use crate::{dprint, huff, info, net, parse};
 
-static void CL_SendConnectPacket_QW(peer_t *p) 
-{
-	char data[2048];
-	char biguserinfo[MAX_INFO_STRING + 32];
+/// Offset of the compressed payload in a Q3 `connect` packet: the -1 header plus `connect `.
+const Q3_CONNECT_PAYLOAD: usize = 12;
 
-	if (p->ps != ps_challenge)
-		return;
+impl Peer {
+    /// Handles an out-of-band packet from the remote server. Returns whether
+    /// the packet should also be passed on to the client.
+    pub fn cl_connectionless(&mut self, data: &[u8]) -> bool {
+        match self.proto {
+            Protocol::Qw => self.cl_connectionless_qw(data),
+            Protocol::Q3 => self.cl_connectionless_q3(data),
+        }
+    }
 
-	// Let the server know what extensions we support.
-	strlcpy (biguserinfo, p->userinfo, sizeof (biguserinfo));
-	snprintf(data, sizeof(data), "\xff\xff\xff\xff" "connect %i %i %i \"%s\"\n", QW_PROTOCOL_VERSION, p->qport, p->challenge, biguserinfo);
+    fn cl_connectionless_qw(&mut self, data: &[u8]) -> bool {
+        let mut reader = MsgReader::new(data);
+        reader.read_long();
+        let Some(command) = reader.read_byte() else {
+            return false;
+        };
 
-	NET_SendPacket(net_from_socket, strlen(data), data, &net_from);
-}
+        match command {
+            S2C_CHALLENGE => {
+                dprint!("{}: challenge\n", self.to.ip());
+                self.challenge = parse::atoi(&reader.read_string());
+                self.send_connect_qw();
+                false
+            }
+            S2C_CONNECTION => {
+                dprint!("{}: connection\n", self.to.ip());
+                if self.state == PeerState::Connected {
+                    dprint!("Dup connect received. Ignored.\n");
+                } else {
+                    self.state = PeerState::Connected;
+                }
+                false
+            }
+            A2C_CLIENT_COMMAND => {
+                dprint!("{}: client command\n", self.to.ip());
+                false
+            }
+            // Let the client see whatever the server is trying to tell it.
+            A2C_PRINT => true,
+            SVC_DISCONNECT => {
+                dprint!("{}: svc_disconnect\n", self.to.ip());
+                false
+            }
+            other => {
+                dprint!(
+                    "CL CL_ConnectionlessPacket {}:\n{}{}\n",
+                    self.to.ip(),
+                    other as char,
+                    qstr(&reader.read_string())
+                );
+                false
+            }
+        }
+    }
 
-// Responses to broadcasts, etc
-static qbool CL_ConnectionlessPacket_QW (peer_t *p) 
-{
-	qbool need_forward = false;
-	int c;
-	
-    MSG_BeginReading();
-    MSG_ReadLong();	// Skip the -1
+    fn send_connect_qw(&self) {
+        if self.state != PeerState::Challenge {
+            return;
+        }
+        let mut packet = format!(
+            "\u{ff}\u{ff}\u{ff}\u{ff}connect {QW_PROTOCOL_VERSION} {} {} \"",
+            self.qport, self.challenge
+        )
+        .into_bytes();
+        // format! wrote the 0xff header as UTF-8; rebuild it as raw bytes.
+        packet.splice(..8, [0xff, 0xff, 0xff, 0xff]);
+        packet.extend_from_slice(&self.userinfo);
+        packet.extend_from_slice(b"\"\n");
+        net::send(&self.socket, &packet, self.to);
+    }
 
-	c = MSG_ReadByte();
+    fn cl_connectionless_q3(&mut self, data: &[u8]) -> bool {
+        let mut reader = MsgReader::new(data);
+        reader.read_long();
+        let line = reader.read_string_line();
+        let args = Args::tokenize(&line);
+        let command = args.arg_str(0);
+        dprint!("CL packet {}: {}\n", self.to, qstr(&line));
 
-	if (MSG_BadRead())
-		return need_forward;	// Runt packet
+        if command.eq_ignore_ascii_case("challengeResponse") {
+            if self.state != PeerState::Challenge {
+                dprint!("Unwanted challenge response received.  Ignored.\n");
+            } else {
+                self.challenge = parse::atoi(args.arg(1));
+                dprint!("challengeResponse: {}\n", self.challenge);
+                self.send_connect_q3();
+            }
+            return false;
+        }
 
-	switch(c) 
-	{
-		case S2C_CHALLENGE:
-		{
-			Sys_DPrintf("%s: challenge\n", inet_ntoa(net_from.sin_addr));
-			p->challenge = atoi(MSG_ReadString());
+        if command.eq_ignore_ascii_case("connectResponse") {
+            match self.state {
+                PeerState::Connected => dprint!("Dup connect received.  Ignored.\n"),
+                PeerState::Drop => {
+                    dprint!("connectResponse packet while not connecting.  Ignored.\n")
+                }
+                PeerState::Challenge => {
+                    dprint!("connectResponse\n");
+                    self.state = PeerState::Connected;
+                }
+            }
+            return false;
+        }
 
-			CL_SendConnectPacket_QW(p);
+        // The server dropped the client but still receives our packets.
+        if command.eq_ignore_ascii_case("disconnect") {
+            self.state = PeerState::Drop;
+            return true;
+        }
 
-			break;
-		}
-		case S2C_CONNECTION:
-		{
-			Sys_DPrintf("%s: connection\n", inet_ntoa(net_from.sin_addr));
+        if command.eq_ignore_ascii_case("print") {
+            dprint!("{}", qstr(&reader.read_string()));
+            return true;
+        }
 
-			if (p->ps >= ps_connected) 
-			{
-				Sys_DPrintf("Dup connect received. Ignored.\n");
-				break;
-			}
+        false
+    }
 
-			p->ps = ps_connected;
+    fn send_connect_q3(&self) {
+        if self.state != PeerState::Challenge {
+            return;
+        }
+        let mut userinfo = self.userinfo.clone();
+        info::set_value_for_key(
+            &mut userinfo,
+            b"challenge",
+            self.challenge.to_string().as_bytes(),
+            info::MAX_INFO_STRING + 100,
+            true,
+        );
 
-			break;
-		}
-		case A2C_CLIENT_COMMAND: 
-		{
-			// Remote command from gui front end
-			Sys_DPrintf("%s: client command\n", inet_ntoa(net_from.sin_addr));
+        let mut msg = MsgWriter::new(2048);
+        msg.write_long(-1);
+        let mut text = b"connect \"".to_vec();
+        text.extend_from_slice(&userinfo);
+        text.push(b'"');
+        msg.print(&text);
 
-			break;
-		}
-		case A2C_PRINT:		
-		{
-			// Print command from somewhere.
-			
-			#ifdef FTE_PEXT_CHUNKEDDOWNLOADS
-			if (net_message.cursize > 100 && !strncmp((char *)net_message.data + 5, "\\chunk", sizeof("\\chunk")-1)) 
-			{
-				CL_Parse_OOB_ChunkedDownload();
-				return;
-			}
-			#endif // FTE_PEXT_CHUNKEDDOWNLOADS
-
-//			Sys_Printf("%s: print\n", inet_ntoa(net_from.sin_addr));
-//			Sys_Printf("%s", MSG_ReadString());
-
-			need_forward = true; // so client have chance to see what server trying to say
-
-			break;
-		}
-		case svc_disconnect:
-		{
-			Sys_DPrintf("%s: svc_disconnect\n", inet_ntoa(net_from.sin_addr));
-			break;
-		}
-		default:
-		{
-			Sys_DPrintf("CL CL_ConnectionlessPacket %s:\n%c%s\n", inet_ntoa(net_from.sin_addr), c, MSG_ReadString());
-			break;
-		}
-	}
-
-	return need_forward;
-}
-
-static void CL_SendConnectPacket_Q3(peer_t *p) 
-{
-	char tmp[128];
-	char data[2048];
-	byte msg_data[2048];
-	char biguserinfo[MAX_INFO_STRING + 100];
-	sizebuf_t msg;
-
-	if (p->ps != ps_challenge)
-		return;
-
-	// add challenge to the temporary userinfo
-	strlcpy (biguserinfo, p->userinfo, sizeof (biguserinfo));
-	snprintf(tmp, sizeof(tmp), "%d", p->challenge);
-	Info_SetValueForKey(biguserinfo, "challenge", tmp, sizeof(biguserinfo));
-	// make string
-	snprintf(data, sizeof(data), "\xff\xff\xff\xff" "connect \"%s\"", biguserinfo);	
-	// init msg
-	SZ_InitEx(&msg, msg_data, sizeof(msg_data), true);
-	SZ_Print(&msg, data);
-	// god damn compress it
-	Huff_EncryptPacket(&msg, 12);
-
-	// ok, send it!
-	NET_SendPacket(net_from_socket, msg.cursize, msg.data, &net_from);
-}
-
-static qbool CL_ConnectionlessPacket_Q3 (peer_t *p) 
-{
-	char	*s, buf[] = "xxx.xxx.xxx.xxx:xxxxx";
-	char	*c;
-	qbool need_forward = false;
-	
-    MSG_BeginReading();
-    MSG_ReadLong();	// Skip the -1
-
-	s = MSG_ReadStringLine();
-	Cmd_TokenizeString( s );
-	c = Cmd_Argv(0);
-
-	if ( developer->integer )
-	{
-		Sys_DPrintf ("CL packet %s: %s\n", NET_AdrToString(&net_from, buf, sizeof(buf)), s);
-	}
-
-	// challenge from the server we are connecting to
-	if ( !stricmp(c, "challengeResponse") )
-	{
-		if ( p->ps != ps_challenge )
-		{
-			Sys_DPrintf( "Unwanted challenge response received.  Ignored.\n" );
-		}
-		else
-		{
-			// start sending connect requests instead of challenge request packets
-			p->challenge = atoi(Cmd_Argv(1));
-
-			// take this address as the new server address.  This allows
-			// a server proxy to hand off connections to multiple servers
-//			clc.serverAddress = from;
-
-			Sys_DPrintf ("challengeResponse: %d\n", p->challenge);
-
-			CL_SendConnectPacket_Q3( p );
-		}
-
-		return need_forward;
-	}
-
-	// server connection
-	if ( !stricmp(c, "connectResponse") )
-	{
-		if ( p->ps >= ps_connected )
-		{
-			Sys_DPrintf ("Dup connect received.  Ignored.\n");
-			return need_forward;
-		}
-
-		if ( p->ps != ps_challenge )
-		{
-			Sys_DPrintf ("connectResponse packet while not connecting.  Ignored.\n");
-			return need_forward;
-		}
-
-		Sys_DPrintf ("connectResponse\n");
-
-		// we are connected now
-		p->ps = ps_connected;
-
-// possibile to lost this message, so moved to the other place where it sended time to time
-//		Netchan_OutOfBandPrint(net_socket, &p->from, "print\n" "/reconnect ASAP!\n");
-
-		return need_forward;
-	}
-
-	// a disconnect message from the server, which will happen if the server
-	// dropped the connection but it is still getting packets from us
-	if ( !stricmp(c, "disconnect") )
-	{
-//		CL_DisconnectPacket( from );
-		p->ps = ps_drop; // drop this peer
-		return need_forward = true; // so client have chance to see what server trying to say
-	}
-
-	// echo request from server
-	if ( !stricmp(c, "print") )
-	{
-		Sys_DPrintf( "%s", MSG_ReadString() );
-		return need_forward = true; // so client have chance to see what server trying to say
-	}
-
-	return need_forward;
-}
-
-
-qbool CL_ConnectionlessPacket (peer_t *p) 
-{
-	if ( p->proto == pr_qw )
-	{
-		return CL_ConnectionlessPacket_QW( p );
-	}
-	else
-	{
-		return CL_ConnectionlessPacket_Q3( p );
-	}
+        let mut packet = msg.into_bytes();
+        huff::compress(&mut packet, Q3_CONNECT_PAYLOAD);
+        net::send(&self.socket, &packet, self.to);
+    }
 }

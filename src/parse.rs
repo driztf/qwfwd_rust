@@ -1,177 +1,112 @@
-/*
-Some token parse functions, too expansive for stand alone file?
-*/
+//! Lenient C-style number parsing (`atoi`/`atof` semantics) for wire and console input.
 
-#include "qwfwd.h"
-
-char com_token[MAX_COM_TOKEN];
-
-/*
-==============
-COM_Parse
-
-Parse a token out of a string
-==============
-*/
-char *COM_Parse (char *data)
-{
-	unsigned char c;
-	int len;
-
-	len = 0;
-	com_token[0] = 0;
-
-	if (!data)
-		return NULL;
-
-	// skip whitespace
-	while (true)
-	{
-		while ( (c = *data) == ' ' || c == '\t' || c == '\r' || c == '\n')
-			data++;
-
-		if (c == 0)
-			return NULL; // end of file;
-
-		// skip // comments
-		if (c=='/' && data[1] == '/')
-		{
-			while (*data && *data != '\n')
-				data++;
-		}
-		else
-			break;
-	}
-
-	// handle quoted strings specially
-	if (c == '\"')
-	{
-		data++;
-		while (1)
-		{
-			c = *data++;
-			if (c=='\"' || !c)
-			{
-				com_token[len] = 0;
-				if (!c)
-					data--;
-				return data;
-			}
-			if (len < MAX_COM_TOKEN-1)
-			{
-				com_token[len] = c;
-				len++;
-			}
-		}
-	}
-
-	// parse a regular word
-	do
-	{
-		if (len < MAX_COM_TOKEN-1)
-		{
-			com_token[len] = c;
-			len++;
-		}
-		data++;
-		c = *data;
-	}
-	while (c && c != ' ' && c != '\t' && c != '\n' && c != '\r');
-
-	com_token[len] = 0;
-	return data;
+fn trim_leading_space(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(s.len());
+    &s[start..]
 }
 
+/// Parses a leading integer, ignoring trailing garbage; `0` when there is none.
+pub fn atoi(s: &[u8]) -> i32 {
+    let s = trim_leading_space(s);
+    let (negative, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
 
-#define DEFAULT_PUNCTUATION "(,{})(\':;=!><&|+"
+    let mut value: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        value = value * 10 + i64::from(b - b'0');
+        if value > i64::from(i32::MAX) + 1 {
+            break;
+        }
+    }
+    let value = if negative { -value } else { value };
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
 
-char *COM_ParseToken (char *data, char *out, int outsize, const char *punctuation)
-{
-	int		c;
-	int		len;
+/// Parses the longest leading floating point number, or `None` when the input
+/// does not start with one.
+pub fn float_prefix(s: &[u8]) -> Option<f64> {
+    let s = trim_leading_space(s);
+    let mut end = 0;
+    if matches!(s.first(), Some(b'+' | b'-')) {
+        end += 1;
+    }
 
-	if (!punctuation)
-		punctuation = DEFAULT_PUNCTUATION;
+    let int_start = end;
+    while end < s.len() && s[end].is_ascii_digit() {
+        end += 1;
+    }
+    let mut has_digits = end > int_start;
 
-	len = 0;
-	out[0] = 0;
+    if s.get(end) == Some(&b'.') {
+        let mut frac_end = end + 1;
+        while frac_end < s.len() && s[frac_end].is_ascii_digit() {
+            frac_end += 1;
+        }
+        if frac_end > end + 1 || has_digits {
+            has_digits = true;
+            end = frac_end;
+        }
+    }
+    if !has_digits {
+        return None;
+    }
 
-	if (!data)
-		return NULL;
+    if matches!(s.get(end), Some(b'e' | b'E')) {
+        let mut exp_end = end + 1;
+        if matches!(s.get(exp_end), Some(b'+' | b'-')) {
+            exp_end += 1;
+        }
+        let exp_digits = exp_end;
+        while exp_end < s.len() && s[exp_end].is_ascii_digit() {
+            exp_end += 1;
+        }
+        if exp_end > exp_digits {
+            end = exp_end;
+        }
+    }
 
-// skip whitespace
-skipwhite:
-	while ( (c = *data) <= ' ')
-	{
-		if (c == 0)
-			return NULL;			// end of file;
-		data++;
-	}
+    std::str::from_utf8(&s[..end]).ok()?.parse().ok()
+}
 
-// skip // comments
-	if (c=='/')
-	{
-		if (data[1] == '/')
-		{
-			while (*data && *data != '\n')
-				data++;
-			goto skipwhite;
-		}
-		else if (data[1] == '*')
-		{
-			data+=2;
-			while (*data && (*data != '*' || data[1] != '/'))
-				data++;
-			data+=2;
-			goto skipwhite;
-		}
-	}
+/// Parses a leading floating point number, ignoring trailing garbage; `0.0` when there is none.
+pub fn atof(s: &[u8]) -> f64 {
+    float_prefix(s).unwrap_or(0.0)
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// handle quoted strings specially
-	if (c == '\"')
-	{
-		data++;
-		while (1)
-		{
-			if (len >= outsize-1)
-			{
-				out[len] = '\0';
-				return data;
-			}
-			c = *data++;
-			if (c=='\"' || !c)
-			{
-				out[len] = 0;
-				return data;
-			}
-			out[len] = c;
-			len++;
-		}
-	}
+    #[test]
+    fn atoi_matches_c_semantics() {
+        assert_eq!(atoi(b"28"), 28);
+        assert_eq!(atoi(b"  -12abc"), -12);
+        assert_eq!(atoi(b"+7"), 7);
+        assert_eq!(atoi(b"abc"), 0);
+        assert_eq!(atoi(b""), 0);
+        assert_eq!(atoi(b"99999999999"), i32::MAX);
+        assert_eq!(atoi(b"-99999999999"), i32::MIN);
+    }
 
-// parse single characters
-	if (strchr(punctuation, c))
-	{
-		out[len] = c;
-		len++;
-		out[len] = 0;
-		return data+1;
-	}
-
-// parse a regular word
-	do
-	{
-		if (len >= outsize-1)
-			break;
-		out[len] = c;
-		data++;
-		len++;
-		c = *data;
-		if (strchr(punctuation, c))
-			break;
-	} while (c>32);
-
-	out[len] = 0;
-	return data;
+    #[test]
+    fn atof_matches_c_semantics() {
+        assert_eq!(atof(b"1.5x"), 1.5);
+        assert_eq!(atof(b".5"), 0.5);
+        assert_eq!(atof(b"1."), 1.0);
+        assert_eq!(atof(b"-2e3"), -2000.0);
+        assert_eq!(atof(b"1e"), 1.0);
+        assert_eq!(atof(b"."), 0.0);
+        assert_eq!(atof(b"junk"), 0.0);
+        assert_eq!(float_prefix(b"junk"), None);
+        assert_eq!(float_prefix(b"10"), Some(10.0));
+    }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "qwfwd"
+version = "1.40.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "QuakeWorld server proxy"
+repository = "https://github.com/QW-Group/qwfwd/"
+
+[dependencies]
+rand = "0.10"
+tokio = { version = "1", features = ["rt", "net", "macros", "signal", "sync", "time"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
