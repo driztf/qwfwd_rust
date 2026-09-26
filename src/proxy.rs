@@ -17,6 +17,7 @@ use crate::ban::{self, Bans};
 use crate::cmd::{Args, Command, Shell};
 use crate::cvar;
 use crate::msg::MSG_BUF_SIZE;
+use crate::pacer::Smoothing;
 use crate::peer::{self, PeerPacket, Peers};
 use crate::protocol::{QWFWD_DEFAULT_PORT, QWFWD_URL, QWFWD_VERSION, QWFWD_VERSION_SHORT};
 use crate::query::{self, Query, Resolution};
@@ -82,6 +83,7 @@ impl Proxy {
         cvars.get("countrycode", "", cvar::SERVERINFO);
         cvars.get("city", "", cvar::SERVERINFO);
         cvars.get("coords", "", cvar::SERVERINFO);
+        Smoothing::register_cvars(cvars);
 
         for (name, cmd) in ban::COMMANDS {
             shell.register(name, Command::External(Handler::Bans(*cmd)));
@@ -113,6 +115,10 @@ impl Proxy {
         usize::try_from(self.shell.cvars.int("maxclients")).unwrap_or(0)
     }
 
+    fn smoothing(&self) -> Smoothing {
+        Smoothing::from_cvars(&self.shell.cvars)
+    }
+
     /// Runs buffered console commands until the buffer is empty or a `wait` is hit.
     fn execute_buffer(&mut self) {
         while let Some(line) = self.shell.cbuf.next_line() {
@@ -130,7 +136,7 @@ impl Proxy {
             Handler::Bans(cmd) => cmd(&mut self.bans, &mut self.shell.cbuf, args),
             Handler::Whitelist(cmd) => cmd(&mut self.whitelist, args),
             Handler::Query(cmd) => cmd(&mut self.query, args),
-            Handler::Peers(cmd) => cmd(&self.peers, args),
+            Handler::Peers(cmd) => cmd(&self.peers, &self.smoothing(), args),
         }
     }
 
@@ -143,6 +149,7 @@ impl Proxy {
                 .insert_text(format!("exec {CONFIG_NAME}\n").as_bytes());
         }
         self.execute_buffer();
+        self.peers.flush(&self.smoothing());
         self.peers.maintenance();
         self.peers.drop_dead();
         self.query.frame(
@@ -207,6 +214,8 @@ pub async fn run(params: Params) -> Result<(), String> {
 
     while !proxy.shell.exit_requested() {
         msg.resize(MSG_BUF_SIZE, 0);
+        // Wake exactly when the next smoothed packet is due, not on the tick.
+        let pacer_deadline = proxy.peers.next_deadline().map(tokio::time::Instant::from);
         tokio::select! {
             received = socket.recv_from(&mut msg) => match received {
                 Ok((len, from)) => {
@@ -235,6 +244,8 @@ pub async fn run(params: Params) -> Result<(), String> {
             }
             _ = hangup.recv() => proxy.reload_requested = true,
             _ = ticker.tick() => proxy.tick(&socket),
+            _ = tokio::time::sleep_until(pacer_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if pacer_deadline.is_some() => proxy.peers.flush(&proxy.smoothing()),
         }
     }
 

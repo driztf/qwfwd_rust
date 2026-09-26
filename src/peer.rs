@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use crate::cmd::Args;
 use crate::console::qstr;
 use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
+use crate::pacer::{Pacer, Smoothing};
 use crate::protocol::{CLC_STRINGCMD, NETCHAN_HEADER};
 use crate::proxy::Event;
 use crate::{cprint, dprint, info, net, parse};
@@ -66,6 +67,8 @@ pub struct Peer {
     connected_at: Instant,
     last_challenge_at: Option<Instant>,
     last_q3_probe_at: Option<Instant>,
+    /// Smoothing queue for game packets headed to the remote server.
+    upstream: Pacer,
 }
 
 impl Drop for Peer {
@@ -87,7 +90,7 @@ impl Peer {
     }
 
     /// Mirrors a mid-game `setinfo "key" "value"` command into the userinfo,
-    /// so the proxy's view of the client (name, colours) stays current.
+    /// so per-client settings such as `smooth` can be changed while connected.
     fn apply_stringcmd(&mut self, command: &[u8]) {
         let args = Args::tokenize(command);
         if args.argc() != 3 || !args.arg(0).eq_ignore_ascii_case(b"setinfo") {
@@ -248,6 +251,7 @@ impl Peers {
                 peer.qport = qport;
                 peer.proto = proto;
                 peer.apply_userinfo(userinfo);
+                peer.upstream.clear();
                 peer.last_seen = now;
                 return Some(index);
             }
@@ -280,6 +284,7 @@ impl Peers {
             connected_at: now,
             last_challenge_at: None,
             last_q3_probe_at: None,
+            upstream: Pacer::default(),
         };
         peer.apply_userinfo(userinfo);
         self.list.push(peer);
@@ -289,7 +294,13 @@ impl Peers {
     /// Forwards a client's packet to its server, honouring the `setinfo` and
     /// `drop` commands it may carry. Connectionless packets are the ones the
     /// caller decided should reach the server (e.g. `rcon`).
-    pub fn forward_from_client(&mut self, from: SocketAddrV4, msg: &[u8], connectionless: bool) {
+    pub fn forward_from_client(
+        &mut self,
+        from: SocketAddrV4,
+        msg: &[u8],
+        connectionless: bool,
+        smoothing: &Smoothing,
+    ) {
         let Some(index) = self.list.iter().position(|p| p.from == from) else {
             return;
         };
@@ -306,10 +317,27 @@ impl Peers {
                     }
                 }
             }
-            // A leaving client's drop is repeated so the server hears it despite packet loss.
-            let copies = if dropping { 3 } else { 1 };
-            for _ in 0..copies {
+            if dropping {
+                for queued in peer.upstream.drain(now) {
+                    net::send(&peer.socket, &queued, peer.to);
+                }
+                // The client is leaving; repeat so the server hears it despite packet loss.
+                for _ in 0..3 {
+                    net::send(&peer.socket, msg, peer.to);
+                }
+            } else if connectionless {
                 net::send(&peer.socket, msg, peer.to);
+            } else {
+                let smoothed = smoothing.policy.applies_to(&peer.userinfo);
+                if !smoothed {
+                    for queued in peer.upstream.drain(now) {
+                        net::send(&peer.socket, &queued, peer.to);
+                    }
+                }
+                let config = smoothed.then_some(&smoothing.config);
+                if let Some(data) = peer.upstream.push(now, msg.to_vec(), config) {
+                    net::send(&peer.socket, &data, peer.to);
+                }
             }
         }
         peer.last_seen = now;
@@ -398,6 +426,34 @@ impl Peers {
             peer.state != PeerState::Drop
         });
     }
+
+    /// Sends every queued packet whose slot has come. Peers no longer being
+    /// smoothed have whatever is still queued sent immediately.
+    pub fn flush(&mut self, smoothing: &Smoothing) {
+        let now = Instant::now();
+        for peer in self
+            .list
+            .iter_mut()
+            .filter(|p| p.state == PeerState::Connected)
+        {
+            let ready = if smoothing.policy.applies_to(&peer.userinfo) {
+                peer.upstream.release(now, &smoothing.config)
+            } else {
+                peer.upstream.drain(now)
+            };
+            for data in ready {
+                net::send(&peer.socket, &data, peer.to);
+            }
+        }
+    }
+
+    /// When the earliest queued packet is due, if any.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.list
+            .iter()
+            .filter_map(|p| p.upstream.next_deadline())
+            .min()
+    }
 }
 
 /// The string commands the proxy acts on (`setinfo`, `drop`) in a QuakeWorld
@@ -423,30 +479,92 @@ fn stringcmds(msg: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
-/// A peer command.
-pub type Cmd = fn(&Peers, &Args);
+/// A peer command; smoothing settings tell it which clients are smoothed.
+pub type Cmd = fn(&Peers, &Smoothing, &Args);
 
-pub const COMMANDS: &[(&str, Cmd)] = &[("cllist", cmd_cllist)];
+pub const COMMANDS: &[(&str, Cmd)] = &[("cllist", cmd_cllist), ("clstats", cmd_clstats)];
 
-fn cmd_cllist(peers: &Peers, _args: &Args) {
+fn cmd_cllist(peers: &Peers, _smoothing: &Smoothing, _args: &Args) {
     cprint!("=== client list ===\n");
     cprint!(
-        "##id## {:<21} {:<21} time name\n",
+        "##id## {:<21} {:<21} time queue dropped name\n",
         "address from",
         "address to"
     );
-    cprint!("-----------------------------------------------------------------------\n");
+    cprint!(
+        "-------------------------------------------------------------------------------------\n"
+    );
     for peer in peers.iter() {
         cprint!(
-            "{:6} {:<21} {:<21} {:4} {}\n",
+            "{:6} {:<21} {:<21} {:4} {:5} {:7} {}\n",
             peer.userid,
             peer.from,
             peer.to,
             peer.minutes_connected(),
+            peer.upstream.queued(),
+            peer.upstream.dropped,
             qstr(&peer.name)
         );
     }
-    cprint!("-----------------------------------------------------------------------\n");
+    cprint!(
+        "-------------------------------------------------------------------------------------\n"
+    );
+    cprint!("{} clients\n", peers.len());
+}
+
+/// Per-client timing over the last few seconds: gaps between packets as they
+/// arrive from the client and as they leave for the server, time spent in
+/// the smoothing queue, and drops.
+fn cmd_clstats(peers: &Peers, smoothing: &Smoothing, _args: &Args) {
+    let now = Instant::now();
+    cprint!(
+        "=== client stats (last {} s, ms) ===\n",
+        crate::stats::WINDOW.as_secs()
+    );
+    cprint!(
+        "{:>6} {:<15} {:^6} {:>5} {:>5} {:>16}  {:>16}  {:>11}  {:>5} {:>5}\n",
+        "##id##",
+        "name",
+        "smooth",
+        "pkts",
+        "dupes",
+        "in avg/sd/max",
+        "out avg/sd/max",
+        "wait avg/max",
+        "queue",
+        "drops"
+    );
+    let rule = "-".repeat(102);
+    cprint!("{rule}\n");
+    for peer in peers.iter() {
+        let stats = &peer.upstream.stats;
+        let arrival = stats.arrival_gap.summary(now);
+        let send = stats.send_gap.summary(now);
+        let wait = stats.wait.summary(now);
+        cprint!(
+            "{:6} {:<15} {:^6} {:5} {:5} {:5.1}/{:4.1}/{:5.1}  {:5.1}/{:4.1}/{:5.1}  {:5.1}/{:5.1}  {:5} {:5}\n",
+            peer.userid,
+            qstr(&peer.name),
+            if smoothing.policy.applies_to(&peer.userinfo) {
+                "on"
+            } else {
+                "off"
+            },
+            stats.recent_arrivals(now),
+            stats.recent_dupes(now),
+            arrival.mean,
+            arrival.stddev,
+            arrival.max,
+            send.mean,
+            send.stddev,
+            send.max,
+            wait.mean,
+            wait.max,
+            peer.upstream.queued(),
+            stats.recent_drops(now)
+        );
+    }
+    cprint!("{rule}\n");
     cprint!("{} clients\n", peers.len());
 }
 

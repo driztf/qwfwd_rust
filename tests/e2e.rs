@@ -122,6 +122,17 @@ impl FakeServer {
             .collect()
     }
 
+    /// Arrival times of matching datagrams, in order.
+    fn arrivals(&self, matches: impl Fn(&[u8]) -> bool) -> Vec<Instant> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, d)| matches(d))
+            .map(|(at, _)| *at)
+            .collect()
+    }
+
     fn wait_for(&self, what: &str, matches: impl Fn(&[u8]) -> bool) -> Vec<u8> {
         wait_until(what, || !self.received(&matches).is_empty());
         self.received(&matches).remove(0)
@@ -266,8 +277,17 @@ fn game_packet(payload: &[u8]) -> Vec<u8> {
     .concat()
 }
 
+/// A numbered game packet, and the predicate that recognises them at the server.
+fn numbered_packet(id: u8) -> Vec<u8> {
+    game_packet(&[b'#', id])
+}
+
+fn is_numbered(data: &[u8]) -> bool {
+    data.len() == 12 && data[10] == b'#'
+}
+
 /// Completes the QW handshake so game packets flow through to `server`.
-/// `userinfo_extra` is appended to the userinfo, e.g. `\spectator\1`.
+/// `userinfo_extra` is appended to the userinfo, e.g. `\smooth\1`.
 fn connect_client(proxy: &Proxy, server: &FakeServer, userinfo_extra: &[u8]) -> Client {
     let client = Client::connect(proxy.addr);
     let challenge = client.get_challenge();
@@ -428,6 +448,202 @@ fn connect_requests_are_validated() {
         reply.starts_with(&[OOB, b"challengeResponse "].concat()),
         "{reply:?}"
     );
+}
+
+#[test]
+fn client_opting_in_gets_smoothed() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = connect_client(&proxy, &server, b"\\smooth\\1");
+
+    for id in 0..6 {
+        client.send(&numbered_packet(id));
+    }
+    wait_until("all six packets to reach the server", || {
+        server.received(is_numbered).len() == 6
+    });
+
+    let ids: Vec<u8> = server.received(is_numbered).iter().map(|d| d[11]).collect();
+    assert_eq!(ids, [0, 1, 2, 3, 4, 5], "order not preserved");
+
+    let arrivals = server.arrivals(is_numbered);
+    let span = arrivals[5].duration_since(arrivals[0]);
+    // Five 13 ms slots at 77 packets/s; without smoothing the burst lands within a millisecond.
+    assert!(
+        span >= Duration::from_millis(45) && span <= Duration::from_millis(400),
+        "burst was not paced: spread over {span:?}"
+    );
+}
+
+#[test]
+fn duplicate_packets_ride_with_their_original() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = connect_client(&proxy, &server, b"\\smooth\\1");
+
+    // Every packet twice, as cl_c2sdupe does.
+    for id in 0..6 {
+        let packet = numbered_packet(id);
+        client.send(&packet);
+        client.send(&packet);
+    }
+    wait_until("all twelve packets to reach the server", || {
+        server.received(is_numbered).len() == 12
+    });
+
+    let ids: Vec<u8> = server.received(is_numbered).iter().map(|d| d[11]).collect();
+    assert_eq!(
+        ids,
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        "order not preserved"
+    );
+
+    // Six slots, not twelve: a copy leaves together with its original.
+    let arrivals = server.arrivals(is_numbered);
+    let span = arrivals[11].duration_since(arrivals[0]);
+    assert!(
+        span >= Duration::from_millis(45) && span <= Duration::from_millis(400),
+        "burst was not paced: spread over {span:?}"
+    );
+    for pair in arrivals.chunks(2) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap < Duration::from_millis(6),
+            "copy was paced apart from its original by {gap:?}"
+        );
+    }
+}
+
+#[test]
+fn upstream_smoothing_drops_stale_backlog() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(&format!("{BASE_CONFIG}set smooth 2\n"), &[]);
+    let client = connect_client(&proxy, &server, b"");
+
+    // 40 packets at once is ~330 ms of queue even at catch-up rate, well past the 200 ms cap.
+    for id in 0..40 {
+        client.send(&numbered_packet(id));
+    }
+    thread::sleep(Duration::from_millis(700));
+
+    let ids: Vec<u8> = server.received(is_numbered).iter().map(|d| d[11]).collect();
+    assert!(
+        ids.len() >= 5 && ids.len() < 40,
+        "expected part of the burst to be dropped, got {} packets",
+        ids.len()
+    );
+    assert_eq!(ids[0], 0, "first packet must be delivered");
+    assert!(
+        ids.windows(2).all(|w| w[0] < w[1]),
+        "order not preserved: {ids:?}"
+    );
+}
+
+#[test]
+fn client_without_opt_in_is_forwarded_immediately() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = connect_client(&proxy, &server, b"");
+
+    for id in 0..6 {
+        client.send(&numbered_packet(id));
+    }
+    wait_until("all six packets to reach the server", || {
+        server.received(is_numbered).len() == 6
+    });
+    let arrivals = server.arrivals(is_numbered);
+    let span = arrivals[5].duration_since(arrivals[0]);
+    assert!(
+        span < Duration::from_millis(30),
+        "burst was paced: {span:?}"
+    );
+}
+
+#[test]
+fn client_can_opt_out_when_smoothing_is_on_for_all() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(&format!("{BASE_CONFIG}set smooth 2\n"), &[]);
+    let client = connect_client(&proxy, &server, b"\\smooth\\0");
+
+    for id in 0..6 {
+        client.send(&numbered_packet(id));
+    }
+    wait_until("all six packets to reach the server", || {
+        server.received(is_numbered).len() == 6
+    });
+    let arrivals = server.arrivals(is_numbered);
+    let span = arrivals[5].duration_since(arrivals[0]);
+    assert!(
+        span < Duration::from_millis(30),
+        "burst was paced: {span:?}"
+    );
+}
+
+/// Sends a burst of six numbered packets and returns how long the server
+/// took to receive them all.
+fn burst_span(client: &Client, server: &FakeServer, first_id: u8) -> Duration {
+    let ids = first_id..first_id + 6;
+    for id in ids.clone() {
+        client.send(&numbered_packet(id));
+    }
+    let mine = |d: &[u8]| is_numbered(d) && ids.contains(&d[11]);
+    wait_until("burst to reach the server", || {
+        server.received(mine).len() == 6
+    });
+    let arrivals = server.arrivals(mine);
+    arrivals[5].duration_since(arrivals[0])
+}
+
+/// A game packet carrying a reliable `setinfo` command, as a client sends mid-game.
+fn setinfo_packet(key: &str, value: &str) -> Vec<u8> {
+    let command = format!("setinfo \"{key}\" \"{value}\"\n\0");
+    game_packet(&[&[4u8][..], command.as_bytes()].concat())
+}
+
+/// The same, as sent by a spectator tracking a player: ezQuake's autocam puts
+/// a binary `clc_tmove` in the reliable stream ahead of the `setinfo`.
+fn spectator_setinfo_packet(key: &str, value: &str) -> Vec<u8> {
+    let command = format!("setinfo \"{key}\" \"{value}\"\n\0");
+    let tmove = [5u8, 0x10, 0x27, 0xf0, 0xd8, 0x04, 0x73];
+    game_packet(&[&tmove[..], &[4u8][..], command.as_bytes()].concat())
+}
+
+#[test]
+fn client_can_toggle_smoothing_mid_game() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = connect_client(&proxy, &server, b"");
+
+    let span = burst_span(&client, &server, 0);
+    assert!(
+        span < Duration::from_millis(30),
+        "paced before opt-in: {span:?}"
+    );
+
+    client.send(&setinfo_packet("smooth", "1"));
+    wait_until("setinfo to be applied", || {
+        proxy.log().contains("setinfo smooth = 1")
+    });
+    let span = burst_span(&client, &server, 10);
+    assert!(
+        span >= Duration::from_millis(45),
+        "not paced after opt-in: {span:?}"
+    );
+
+    client.send(&spectator_setinfo_packet("smooth", "0"));
+    wait_until("setinfo to be applied", || {
+        proxy.log().contains("setinfo smooth = 0")
+    });
+    // Let the pacer's slot from the previous burst expire.
+    thread::sleep(Duration::from_millis(30));
+    let span = burst_span(&client, &server, 20);
+    assert!(
+        span < Duration::from_millis(30),
+        "still paced after opt-out: {span:?}"
+    );
+
+    // The setinfo packets themselves were forwarded to the server too.
+    assert_eq!(server.received(|d| contains(d, b"setinfo")).len(), 2);
 }
 
 #[test]

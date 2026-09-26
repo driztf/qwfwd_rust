@@ -7,11 +7,13 @@ mod huff;
 mod info;
 mod msg;
 mod net;
+mod pacer;
 mod parse;
 mod peer;
 mod protocol;
 mod proxy;
 mod query;
+mod stats;
 
 mod whitelist;
 
