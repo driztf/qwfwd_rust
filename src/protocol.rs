@@ -25,3 +25,9 @@ pub const A2C_CLIENT_COMMAND: u8 = b'B';
 pub const SVC_DISCONNECT: u8 = 2;
 /// Client to server: a string command follows.
 pub const CLC_STRINGCMD: u8 = 4;
+
+/// The QuakeWorld netchan header: sequence, acknowledged sequence, qport.
+pub const NETCHAN_HEADER: usize = 10;
+/// Offset of the Huffman-compressed payload in a Q3 `connect` packet: the
+/// out-of-band header plus `connect `.
+pub const Q3_CONNECT_PAYLOAD: usize = 12;

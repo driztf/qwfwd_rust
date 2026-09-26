@@ -1,9 +1,23 @@
 //! Console output and the `developer` verbosity level.
 
 use std::io::Write;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use rustyline::ExternalPrinter;
+
 static DEVELOPER: AtomicI32 = AtomicI32::new(0);
+
+/// Output goes through the interactive line editor when one is running, so
+/// log lines do not garble the command being typed.
+struct Interactive {
+    printer: Box<dyn ExternalPrinter + Send>,
+    /// Text since the last newline; the editor redraws its prompt after every
+    /// message, so only whole lines are handed over.
+    partial: String,
+}
+
+static INTERACTIVE: Mutex<Option<Interactive>> = Mutex::new(None);
 
 pub fn developer() -> i32 {
     DEVELOPER.load(Ordering::Relaxed)
@@ -13,7 +27,33 @@ pub fn set_developer(level: i32) {
     DEVELOPER.store(level, Ordering::Relaxed);
 }
 
+/// Routes subsequent output through an interactive line editor.
+pub fn set_printer(printer: Box<dyn ExternalPrinter + Send>) {
+    if let Ok(mut guard) = INTERACTIVE.lock() {
+        *guard = Some(Interactive {
+            printer,
+            partial: String::new(),
+        });
+    }
+}
+
 pub fn print(text: &str) {
+    if let Ok(mut guard) = INTERACTIVE.lock()
+        && let Some(interactive) = guard.as_mut()
+    {
+        interactive.partial.push_str(text);
+        let Some(newline) = interactive.partial.rfind('\n') else {
+            return;
+        };
+        let rest = interactive.partial.split_off(newline + 1);
+        let lines = std::mem::replace(&mut interactive.partial, rest);
+        if interactive.printer.print(lines).is_ok() {
+            return;
+        }
+        // The editor is gone; fall back to plain stdout from now on.
+        *guard = None;
+    }
+
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(text.as_bytes());
     let _ = out.flush();

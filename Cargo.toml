@@ -8,6 +8,10 @@ repository = "https://github.com/QW-Group/qwfwd/"
 
 [dependencies]
 rand = "0.10"
+# Pinned past 18.0.1: with an external printer, released versions process
+# buffered keystrokes one per terminal event, so pasted or fast input stalls
+# until the next key. Go back to a crates.io version once one ships the fix.
+rustyline = { git = "https://github.com/kkawakam/rustyline.git", rev = "05eb9200f178989ad504718179f11890cfe362c9" }
 tokio = { version = "1", features = ["rt", "net", "macros", "signal", "sync", "time"] }
 
 [profile.release]
@@ -16,4 +20,4 @@ codegen-units = 1
 strip = true
 
 [target."cfg(unix)".dev-dependencies]
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["signal", "term"] }

@@ -1,18 +1,15 @@
 //! Client-side handling of connectionless packets from remote servers: the
 //! proxy plays the client while completing the handshake on a peer's behalf.
 
+use super::{Peer, PeerState, Protocol};
 use crate::cmd::Args;
 use crate::console::qstr;
-use crate::msg::{MsgReader, MsgWriter};
-use crate::peer::{Peer, PeerState, Protocol};
+use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
 use crate::protocol::{
-    A2C_CLIENT_COMMAND, A2C_PRINT, QW_PROTOCOL_VERSION, S2C_CHALLENGE, S2C_CONNECTION,
-    SVC_DISCONNECT,
+    A2C_CLIENT_COMMAND, A2C_PRINT, Q3_CONNECT_PAYLOAD, QW_PROTOCOL_VERSION, S2C_CHALLENGE,
+    S2C_CONNECTION, SVC_DISCONNECT,
 };
 use crate::{dprint, huff, info, net, parse};
-
-/// Offset of the compressed payload in a Q3 `connect` packet: the -1 header plus `connect `.
-const Q3_CONNECT_PAYLOAD: usize = 12;
 
 impl Peer {
     /// Handles an out-of-band packet from the remote server. Returns whether
@@ -59,7 +56,7 @@ impl Peer {
             }
             other => {
                 dprint!(
-                    "CL CL_ConnectionlessPacket {}:\n{}{}\n",
+                    "unhandled out-of-band message from {}: {}{}\n",
                     self.to.ip(),
                     other as char,
                     qstr(&reader.read_string())
@@ -73,16 +70,17 @@ impl Peer {
         if self.state != PeerState::Challenge {
             return;
         }
-        let mut packet = format!(
-            "\u{ff}\u{ff}\u{ff}\u{ff}connect {QW_PROTOCOL_VERSION} {} {} \"",
-            self.qport, self.challenge
-        )
-        .into_bytes();
-        // format! wrote the 0xff header as UTF-8; rebuild it as raw bytes.
-        packet.splice(..8, [0xff, 0xff, 0xff, 0xff]);
-        packet.extend_from_slice(&self.userinfo);
-        packet.extend_from_slice(b"\"\n");
-        net::send(&self.socket, &packet, self.to);
+        let mut packet = MsgWriter::out_of_band(MSG_BUF_SIZE);
+        packet.write(
+            format!(
+                "connect {QW_PROTOCOL_VERSION} {} {} \"",
+                self.qport, self.challenge
+            )
+            .as_bytes(),
+        );
+        packet.write(&self.userinfo);
+        packet.write(b"\"\n");
+        net::send(&self.socket, packet.as_bytes(), self.to);
     }
 
     fn cl_connectionless_q3(&mut self, data: &[u8]) -> bool {
@@ -145,8 +143,7 @@ impl Peer {
             true,
         );
 
-        let mut msg = MsgWriter::new(2048);
-        msg.write_long(-1);
+        let mut msg = MsgWriter::out_of_band(MSG_BUF_SIZE);
         let mut text = b"connect \"".to_vec();
         text.extend_from_slice(&userinfo);
         text.push(b'"');

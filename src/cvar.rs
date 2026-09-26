@@ -3,9 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::cmd::Args;
-use crate::info::MAX_INFO_STRING;
-use crate::proxy::Proxy;
-use crate::{console, cprint, dprint, info, parse};
+use crate::{cprint, dprint, parse};
 
 pub const ARCHIVE: u32 = 1 << 0;
 /// Mirrored into the serverinfo string.
@@ -20,7 +18,7 @@ pub const USER_CREATED: u32 = 1 << 4;
 pub struct Cvar {
     pub name: String,
     pub string: String,
-    pub value: f32,
+    pub value: f64,
     pub integer: i32,
     pub flags: u32,
     pub modified: bool,
@@ -29,7 +27,6 @@ pub struct Cvar {
 #[derive(Default)]
 pub struct Cvars {
     vars: BTreeMap<String, Cvar>,
-    pub serverinfo: Vec<u8>,
     /// Once startup completes, NOSET cvars become write protected.
     pub locked: bool,
 }
@@ -104,13 +101,13 @@ impl Cvars {
         }
     }
 
-    pub fn set_value(&mut self, name: &str, value: f32) {
+    pub fn set_value(&mut self, name: &str, value: f64) {
         self.set(name, &value.to_string());
     }
 
     pub fn create(&mut self, name: &str, value: &str, flags: u32) {
         if self.find(name).is_some() {
-            dprint!("Cvar_Create: cvar {name} already exist, unexpected\n");
+            dprint!("cvar {name} already exists\n");
             return;
         }
         self.vars.insert(
@@ -140,40 +137,14 @@ impl Cvars {
         }
 
         var.string = value.to_owned();
-        var.value = parse::atof(value.as_bytes()) as f32;
+        var.value = parse::atof(value.as_bytes());
         var.integer = parse::atoi(value.as_bytes());
         var.modified = true;
-        let (display_name, flags, integer) = (var.name.clone(), var.flags, var.integer);
-
-        if display_name.eq_ignore_ascii_case("developer") {
-            console::set_developer(integer);
-        }
-
-        if flags & SERVERINFO != 0
-            && info::value_for_key(&self.serverinfo, display_name.as_bytes()) != value.as_bytes()
-        {
-            info::set_value_for_star_key(
-                &mut self.serverinfo,
-                display_name.as_bytes(),
-                value.as_bytes(),
-                MAX_INFO_STRING,
-                true,
-            );
-        }
-    }
-}
-
-impl Proxy {
-    pub fn register_cvar_commands(&mut self) {
-        self.cmds.register("cvarlist", cmd_cvarlist);
-        self.cmds.register("toggle", cmd_toggle);
-        self.cmds.register("set", cmd_set);
-        self.cmds.register("inc", cmd_inc);
     }
 
     /// Handles `<cvar>` (print) and `<cvar> <value>` (assign) console lines.
-    pub fn cvar_command(&mut self, args: &Args) -> bool {
-        let Some(var) = self.cvars.find(&args.arg_str(0)) else {
+    pub fn console_command(&mut self, args: &Args) -> bool {
+        let Some(var) = self.find(&args.arg_str(0)) else {
             return false;
         };
         if args.argc() == 1 {
@@ -181,15 +152,25 @@ impl Proxy {
         } else {
             let name = var.name.clone();
             let value = args.join(1, args.argc() - 1);
-            self.cvars.set(&name, &value);
+            self.set(&name, &value);
         }
         true
     }
 }
 
-fn cmd_cvarlist(proxy: &mut Proxy, _args: &Args) {
+/// A console command that only touches the cvars.
+pub type Cmd = fn(&mut Cvars, &Args);
+
+pub const COMMANDS: &[(&str, Cmd)] = &[
+    ("cvarlist", cmd_cvarlist),
+    ("toggle", cmd_toggle),
+    ("set", cmd_set),
+    ("inc", cmd_inc),
+];
+
+fn cmd_cvarlist(cvars: &mut Cvars, _args: &Args) {
     let mut count = 0;
-    for var in proxy.cvars.iter() {
+    for var in cvars.iter() {
         cprint!(
             "{}{} {}\n",
             if var.flags & ARCHIVE != 0 { '*' } else { ' ' },
@@ -205,56 +186,84 @@ fn cmd_cvarlist(proxy: &mut Proxy, _args: &Args) {
     cprint!("------------\n{count} variables\n");
 }
 
-fn cmd_toggle(proxy: &mut Proxy, args: &Args) {
+fn cmd_toggle(cvars: &mut Cvars, args: &Args) {
     if args.argc() != 2 {
         cprint!("toggle <cvar> : toggle a cvar on/off\n");
         return;
     }
     let name = args.arg_str(1);
-    let Some(var) = proxy.cvars.find(&name) else {
+    let Some(var) = cvars.find(&name) else {
         cprint!("Unknown variable \"{name}\"\n");
         return;
     };
     let (name, toggled) = (var.name.clone(), if var.value != 0.0 { "0" } else { "1" });
-    proxy.cvars.set(&name, toggled);
+    cvars.set(&name, toggled);
 }
 
-fn cmd_set(proxy: &mut Proxy, args: &Args) {
+fn cmd_set(cvars: &mut Cvars, args: &Args) {
     if args.argc() < 3 {
         cprint!("usage: set <cvar> <value>\n");
         return;
     }
     let name = args.arg_str(1).into_owned();
     let value = args.join(2, args.argc() - 1);
-    if proxy.cvars.find(&name).is_some() {
-        proxy.cvars.set(&name, &value);
+    if cvars.find(&name).is_some() {
+        cvars.set(&name, &value);
     } else {
-        proxy.cvars.create(&name, &value, USER_CREATED);
+        cvars.create(&name, &value, USER_CREATED);
     }
 }
 
-fn cmd_inc(proxy: &mut Proxy, args: &Args) {
+fn cmd_inc(cvars: &mut Cvars, args: &Args) {
     if !matches!(args.argc(), 2 | 3) {
         cprint!("inc <cvar> [value]\n");
         return;
     }
     let name = args.arg_str(1);
-    let Some(var) = proxy.cvars.find(&name) else {
+    let Some(var) = cvars.find(&name) else {
         cprint!("Unknown variable \"{name}\"\n");
         return;
     };
     let delta = if args.argc() == 3 {
-        parse::atof(args.arg(2)) as f32
+        parse::atof(args.arg(2))
     } else {
         1.0
     };
     let (name, value) = (var.name.clone(), var.value + delta);
-    proxy.cvars.set_value(&name, value);
+    cvars.set_value(&name, value);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(cvars: &mut Cvars, line: &[u8]) {
+        let args = Args::tokenize(line);
+        let name = args.arg_str(0).into_owned();
+        let (_, cmd) = COMMANDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("known cvar command");
+        cmd(cvars, &args);
+    }
+
+    #[test]
+    fn set_toggle_and_inc_commands() {
+        let mut cvars = Cvars::default();
+        run(&mut cvars, b"set foo 1.5");
+        assert_eq!(cvars.find("foo").unwrap().flags, USER_CREATED);
+        run(&mut cvars, b"inc foo");
+        assert_eq!(cvars.string("foo"), "2.5");
+        run(&mut cvars, b"inc foo -2");
+        assert_eq!(cvars.string("foo"), "0.5");
+        run(&mut cvars, b"toggle foo");
+        assert_eq!(cvars.string("foo"), "0");
+        run(&mut cvars, b"toggle foo");
+        assert_eq!(cvars.string("foo"), "1");
+        assert!(cvars.console_command(&Args::tokenize(b"foo 7")));
+        assert_eq!(cvars.int("foo"), 7);
+        assert!(!cvars.console_command(&Args::tokenize(b"nosuch 7")));
+    }
 
     #[test]
     fn get_keeps_config_values_and_clears_user_flag() {
@@ -283,16 +292,6 @@ mod tests {
         assert_eq!(cvars.string("net_ip"), "10.0.0.1");
         cvars.full_set("net_ip", "10.0.0.3", NOSET);
         assert_eq!(cvars.string("net_ip"), "10.0.0.3");
-    }
-
-    #[test]
-    fn serverinfo_mirrors_flagged_cvars() {
-        let mut cvars = Cvars::default();
-        cvars.get("hostname", "unnamed", SERVERINFO);
-        cvars.get("developer", "0", 0);
-        assert_eq!(cvars.serverinfo, b"\\hostname\\unnamed");
-        cvars.set("hostname", "my proxy");
-        assert_eq!(cvars.serverinfo, b"\\hostname\\my proxy");
     }
 
     #[test]

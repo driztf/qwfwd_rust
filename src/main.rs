@@ -1,5 +1,4 @@
 mod ban;
-mod clc;
 mod cmd;
 mod console;
 mod cvar;
@@ -13,7 +12,7 @@ mod peer;
 mod protocol;
 mod proxy;
 mod query;
-mod svc;
+
 mod whitelist;
 
 use std::process::ExitCode;
@@ -34,7 +33,10 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let port = argv.get(1).map_or(0, |s| parse::atoi(s.as_bytes()));
+    let port = argv
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .filter(|&port| port != 0);
     let ip = argv
         .get(2)
         .filter(|s| !s.starts_with(['-', '+']))

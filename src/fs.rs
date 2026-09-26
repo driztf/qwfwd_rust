@@ -10,9 +10,9 @@ pub fn file_extension(path: &str) -> &str {
     path.rfind('.').map_or("", |i| &path[i..])
 }
 
-/// Reads a config file from the same search path the original proxy used.
+/// Reads a config file from `qwfwd/`, falling back to the working directory.
 pub fn read_config(name: &str) -> Option<Vec<u8>> {
-    ["qwfwd", "id1", "", "qw"].iter().find_map(|dir| {
+    ["qwfwd", ""].iter().find_map(|dir| {
         let path = if dir.is_empty() {
             name.to_owned()
         } else {

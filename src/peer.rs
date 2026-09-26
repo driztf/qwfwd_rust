@@ -1,5 +1,7 @@
 //! Forwarded clients ("peers"): one remote-facing socket per connected client.
 
+mod clc;
+
 use std::net::SocketAddrV4;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,8 +13,8 @@ use tokio::task::JoinHandle;
 use crate::cmd::Args;
 use crate::console::qstr;
 use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
-use crate::protocol::{A2A_ACK, CLC_STRINGCMD};
-use crate::proxy::Proxy;
+use crate::protocol::{CLC_STRINGCMD, NETCHAN_HEADER};
+use crate::proxy::Event;
 use crate::{cprint, dprint, info, net, parse};
 
 /// Clients silent this long are dropped.
@@ -45,23 +47,23 @@ pub struct PeerPacket {
 }
 
 pub struct Peer {
-    pub userid: i32,
+    userid: i32,
     /// The client.
-    pub from: SocketAddrV4,
+    from: SocketAddrV4,
     /// The remote server.
-    pub to: SocketAddrV4,
-    pub socket: Arc<UdpSocket>,
+    to: SocketAddrV4,
+    socket: Arc<UdpSocket>,
     reader: JoinHandle<()>,
-    pub state: PeerState,
-    pub proto: Protocol,
-    pub challenge: i32,
-    pub userinfo: Vec<u8>,
-    pub name: Vec<u8>,
-    pub top_color: i32,
-    pub bottom_color: i32,
-    pub qport: i32,
-    pub last_seen: Instant,
-    pub connected_at: Instant,
+    state: PeerState,
+    proto: Protocol,
+    challenge: i32,
+    userinfo: Vec<u8>,
+    name: Vec<u8>,
+    top_color: i32,
+    bottom_color: i32,
+    qport: i32,
+    last_seen: Instant,
+    connected_at: Instant,
     last_challenge_at: Option<Instant>,
     last_q3_probe_at: Option<Instant>,
 }
@@ -75,9 +77,58 @@ impl Drop for Peer {
 impl Peer {
     fn apply_userinfo(&mut self, userinfo: &[u8]) {
         self.userinfo = userinfo.to_vec();
-        self.name = info::value_for_key(userinfo, b"name").to_vec();
-        self.top_color = parse_color(userinfo, b"topcolor");
-        self.bottom_color = parse_color(userinfo, b"bottomcolor");
+        self.refresh_from_userinfo();
+    }
+
+    fn refresh_from_userinfo(&mut self) {
+        self.name = info::value_for_key(&self.userinfo, b"name").to_vec();
+        self.top_color = parse_color(&self.userinfo, b"topcolor");
+        self.bottom_color = parse_color(&self.userinfo, b"bottomcolor");
+    }
+
+    /// Mirrors a mid-game `setinfo "key" "value"` command into the userinfo,
+    /// so the proxy's view of the client (name, colours) stays current.
+    fn apply_stringcmd(&mut self, command: &[u8]) {
+        let args = Args::tokenize(command);
+        if args.argc() != 3 || !args.arg(0).eq_ignore_ascii_case(b"setinfo") {
+            return;
+        }
+        dprint!(
+            "{}: setinfo {} = {}\n",
+            self.from,
+            qstr(args.arg(1)),
+            qstr(args.arg(2))
+        );
+        info::set_value_for_key(
+            &mut self.userinfo,
+            args.arg(1),
+            args.arg(2),
+            info::MAX_INFO_STRING,
+            true,
+        );
+        self.refresh_from_userinfo();
+    }
+
+    pub fn userid(&self) -> i32 {
+        self.userid
+    }
+
+    pub fn state(&self) -> PeerState {
+        self.state
+    }
+
+    /// The challenge the remote server issued.
+    pub fn challenge(&self) -> i32 {
+        self.challenge
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Top and bottom colours from the userinfo.
+    pub fn colors(&self) -> (i32, i32) {
+        (self.top_color, self.bottom_color)
     }
 
     pub fn minutes_connected(&self) -> u64 {
@@ -89,24 +140,14 @@ fn parse_color(userinfo: &[u8], key: &[u8]) -> i32 {
     parse::atoi(info::value_for_key(userinfo, key)).clamp(0, 16)
 }
 
-/// What a peer's reader task reports to the main loop.
-pub enum PeerEvent {
-    Packet(PeerPacket),
-    /// The peer's socket can no longer be read, so the peer is useless.
-    Lost {
-        userid: i32,
-        error: String,
-    },
-}
-
 /// Pumps datagrams from a peer's socket into the main loop.
-async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerEvent>) {
+async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, events: mpsc::Sender<Event>) {
     let mut buf = vec![0u8; MSG_BUF_SIZE];
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, from)) => {
                 if len >= MSG_BUF_SIZE {
-                    cprint!("NET_GetPacket: Oversize packet from {}\n", from.ip());
+                    dprint!("oversize packet from {} dropped\n", from.ip());
                     continue;
                 }
                 let Some(from) = net::v4(from) else { continue };
@@ -115,12 +156,12 @@ async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerE
                     from,
                     data: buf[..len].to_vec(),
                 };
-                if tx.send(PeerEvent::Packet(packet)).await.is_err() {
+                if events.send(Event::PeerPacket(packet)).await.is_err() {
                     return;
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
-                dprint!("NET_GetPacket: Connection was forcibly closed\n");
+                dprint!("connection reset on peer {userid}'s socket\n");
             }
             Err(err) if net::is_oversize(&err) => {
                 cprint!("NET_GetPacket: Oversize packet\n");
@@ -128,71 +169,91 @@ async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerE
             Err(err) => {
                 // Nobody would read this socket again; have the peer dropped
                 // rather than leave the client with a one-way connection.
-                let lost = PeerEvent::Lost {
+                let lost = Event::PeerLost {
                     userid,
                     error: err.to_string(),
                 };
-                let _ = tx.send(lost).await;
+                let _ = events.send(lost).await;
                 return;
             }
         }
     }
 }
 
-impl Proxy {
-    pub fn register_peer_commands(&mut self) {
-        self.cmds.register("cllist", cmd_cllist);
+/// A client to start forwarding, once its connect request has been validated.
+pub struct Registration<'a> {
+    /// The remote server.
+    pub to: SocketAddrV4,
+    /// The client.
+    pub from: SocketAddrV4,
+    pub userinfo: &'a [u8],
+    pub qport: i32,
+    pub proto: Protocol,
+}
+
+/// The table of forwarded clients.
+#[derive(Default)]
+pub struct Peers {
+    list: Vec<Peer>,
+    next_userid: i32,
+}
+
+impl Peers {
+    pub fn len(&self) -> usize {
+        self.list.len()
     }
 
-    pub fn peer_by_addr(&self, from: SocketAddrV4) -> Option<&Peer> {
-        self.peers.iter().find(|p| p.from == from)
+    pub fn iter(&self) -> impl Iterator<Item = &Peer> {
+        self.list.iter()
     }
 
-    fn peer_by_addr_mut(&mut self, from: SocketAddrV4) -> Option<&mut Peer> {
-        self.peers.iter_mut().find(|p| p.from == from)
+    pub fn get(&self, from: SocketAddrV4) -> Option<&Peer> {
+        self.list.iter().find(|p| p.from == from)
     }
 
-    /// Registers a client for forwarding to `host:port`, reusing an existing
-    /// peer for the same client address. Returns the peer's index.
-    pub async fn peer_new(
+    pub fn get_index(&self, index: usize) -> Option<&Peer> {
+        self.list.get(index)
+    }
+
+    /// Registers a client for forwarding, reusing an existing peer for the
+    /// same client address. Returns the peer's index, or `None` when the
+    /// table is full or no socket could be opened.
+    pub fn register(
         &mut self,
-        host: &str,
-        port: u16,
-        from: SocketAddrV4,
-        userinfo: &[u8],
-        qport: i32,
-        proto: Protocol,
+        registration: Registration,
+        max_clients: usize,
+        events: &mpsc::Sender<Event>,
     ) -> Option<usize> {
-        let to = net::resolve(host, port).await?;
-        if !self.whitelist.allows(*to.ip()) || self.bans.is_banned(to) {
-            return None;
-        }
-
-        if let Some(index) = self.peers.iter().position(|p| p.from == from) {
-            let peer = &mut self.peers[index];
+        let Registration {
+            to,
+            from,
+            userinfo,
+            qport,
+            proto,
+        } = registration;
+        if let Some(index) = self.list.iter().position(|p| p.from == from) {
+            let peer = &mut self.list[index];
+            let now = Instant::now();
             peer.to = to;
             // A reconnecting Q3 client keeps its state; the server side is unaware of the reconnect.
             if proto != Protocol::Q3 {
                 peer.state = PeerState::Challenge;
+                peer.connected_at = now;
             }
             peer.qport = qport;
             peer.proto = proto;
             peer.apply_userinfo(userinfo);
-            peer.last_seen = Instant::now();
+            peer.last_seen = now;
             return Some(index);
         }
 
-        if self.peers.len() >= self.max_clients() {
+        if self.list.len() >= max_clients {
             return None;
         }
-        let socket = Arc::new(net::open_ephemeral_socket().await.ok()?);
+        let socket = Arc::new(net::open_ephemeral_socket().ok()?);
         self.next_userid += 1;
         let userid = self.next_userid;
-        let reader = tokio::spawn(peer_reader(
-            userid,
-            Arc::clone(&socket),
-            self.peer_tx.clone(),
-        ));
+        let reader = tokio::spawn(peer_reader(userid, Arc::clone(&socket), events.clone()));
 
         let now = Instant::now();
         let mut peer = Peer {
@@ -215,74 +276,47 @@ impl Proxy {
             last_q3_probe_at: None,
         };
         peer.apply_userinfo(userinfo);
-        self.peers.push(peer);
-        Some(self.peers.len() - 1)
+        self.list.push(peer);
+        Some(self.list.len() - 1)
     }
 
-    pub fn max_clients(&self) -> usize {
-        usize::try_from(self.cvars.int("maxclients")).unwrap_or(0)
-    }
-
-    /// Handles a datagram from a client on the proxy socket.
-    pub async fn handle_client_packet(
-        &mut self,
-        socket: &UdpSocket,
-        from: SocketAddrV4,
-        msg: &mut Vec<u8>,
-    ) {
-        if self.bans.is_banned(from) {
-            return;
-        }
-        if msg.as_slice() == [A2A_ACK] {
-            self.query.ping_reply(&self.cvars, from);
-            return;
-        }
-
-        let connectionless = match MsgReader::new(msg).read_long() {
-            None => return,
-            Some(-1) => true,
-            Some(_) => false,
-        };
-        if connectionless && !self.sv_connectionless(socket, from, msg).await {
-            return;
-        }
-
-        let Some(peer) = self.peer_by_addr_mut(from) else {
+    /// Forwards a client's packet to its server, honouring the `setinfo` and
+    /// `drop` commands it may carry. Connectionless packets are the ones the
+    /// caller decided should reach the server (e.g. `rcon`).
+    pub fn forward_from_client(&mut self, from: SocketAddrV4, msg: &[u8], connectionless: bool) {
+        let Some(index) = self.list.iter().position(|p| p.from == from) else {
             return;
         };
+        let peer = &mut self.list[index];
+        let now = Instant::now();
+        let mut dropping = false;
         if peer.state == PeerState::Connected {
-            let mut copies = 1;
-            if peer.proto == Protocol::Qw && !connectionless && is_drop_command(msg) {
-                peer.state = PeerState::Drop;
-                // The client is leaving; repeat so the server hears it despite packet loss.
-                copies = 3;
+            if peer.proto == Protocol::Qw && !connectionless {
+                for command in stringcmds(msg) {
+                    if command == b"drop" {
+                        dropping = true;
+                    } else {
+                        peer.apply_stringcmd(command);
+                    }
+                }
             }
+            // A leaving client's drop is repeated so the server hears it despite packet loss.
+            let copies = if dropping { 3 } else { 1 };
             for _ in 0..copies {
                 net::send(&peer.socket, msg, peer.to);
             }
         }
-        peer.last_seen = Instant::now();
-    }
-
-    /// Handles a datagram from a remote server on a peer's socket.
-    /// Handles what a peer's reader task reported.
-    pub fn handle_peer_event(&mut self, socket: &UdpSocket, event: PeerEvent) {
-        match event {
-            PeerEvent::Packet(packet) => self.handle_server_packet(socket, packet),
-            PeerEvent::Lost { userid, error } => {
-                if let Some(peer) = self.peers.iter_mut().find(|p| p.userid == userid) {
-                    cprint!("NET_GetPacket: recvfrom: {error}, dropping peer {userid}\n");
-                    peer.state = PeerState::Drop;
-                }
-            }
+        peer.last_seen = now;
+        if dropping {
+            dprint!("peer {from} dropped\n");
+            self.list.remove(index);
         }
     }
 
+    /// Handles a datagram from a remote server on a peer's socket, passing
+    /// game traffic and selected out-of-band messages on to the client.
     pub fn handle_server_packet(&mut self, socket: &UdpSocket, packet: PeerPacket) {
-        if self.bans.is_banned(packet.from) {
-            return;
-        }
-        let Some(peer) = self.peers.iter_mut().find(|p| p.userid == packet.userid) else {
+        let Some(peer) = self.list.iter_mut().find(|p| p.userid == packet.userid) else {
             return;
         };
         if peer.to != packet.from {
@@ -304,9 +338,9 @@ impl Proxy {
     }
 
     /// Times out silent peers, re-sends pending challenges and probes idle Q3 servers.
-    pub fn peer_maintenance(&mut self) {
+    pub fn maintenance(&mut self) {
         let now = Instant::now();
-        for peer in &mut self.peers {
+        for peer in &mut self.list {
             if peer.proto == Protocol::Q3
                 && peer.state == PeerState::Connected
                 && now.duration_since(peer.last_seen) > Q3_IDLE
@@ -341,8 +375,17 @@ impl Proxy {
         }
     }
 
-    pub fn drop_dead_peers(&mut self) {
-        self.peers.retain(|peer| {
+    /// A peer's socket can no longer be read (its reader task reported
+    /// `error` and ended): the peer is useless and is marked for dropping.
+    pub fn lose(&mut self, userid: i32, error: &str) {
+        if let Some(peer) = self.list.iter_mut().find(|p| p.userid == userid) {
+            cprint!("peer {userid}: recvfrom failed: {error}; dropping\n");
+            peer.state = PeerState::Drop;
+        }
+    }
+
+    pub fn drop_dead(&mut self) {
+        self.list.retain(|peer| {
             if peer.state == PeerState::Drop {
                 dprint!("peer {} dropped\n", peer.from);
             }
@@ -351,18 +394,35 @@ impl Proxy {
     }
 }
 
-/// A QuakeWorld game packet whose first command is the client's `drop`.
-/// The netchan header occupies the first 10 bytes.
-fn is_drop_command(msg: &[u8]) -> bool {
-    if msg.len() <= 10 || msg[10] != CLC_STRINGCMD {
-        return false;
-    }
-    let text = &msg[11..];
-    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
-    &text[..end] == b"drop"
+/// The string commands the proxy acts on (`setinfo`, `drop`) in a QuakeWorld
+/// game packet.
+///
+/// They travel in the reliable stream at the front of the packet, but so do
+/// binary commands such as a tracking spectator's `clc_tmove`, whose size
+/// depends on protocol extensions the proxy does not see negotiated. Rather
+/// than parse the stream, look for the `clc_stringcmd` byte immediately
+/// followed by one of the command names; those markers do not occur by
+/// accident in move data.
+fn stringcmds(msg: &[u8]) -> impl Iterator<Item = &[u8]> {
+    const NAMES: [&[u8]; 2] = [b"setinfo", b"drop"];
+    let mut rest = msg.get(NETCHAN_HEADER..).unwrap_or(&[]);
+    std::iter::from_fn(move || {
+        let start = (0..rest.len()).find(|&i| {
+            rest[i] == CLC_STRINGCMD && NAMES.iter().any(|name| rest[i + 1..].starts_with(name))
+        })?;
+        let text = &rest[start + 1..];
+        let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+        rest = text.get(end + 1..).unwrap_or(&[]);
+        Some(&text[..end])
+    })
 }
 
-fn cmd_cllist(proxy: &mut Proxy, _args: &Args) {
+/// A peer command.
+pub type Cmd = fn(&Peers, &Args);
+
+pub const COMMANDS: &[(&str, Cmd)] = &[("cllist", cmd_cllist)];
+
+fn cmd_cllist(peers: &Peers, _args: &Args) {
     cprint!("=== client list ===\n");
     cprint!(
         "##id## {:<21} {:<21} time name\n",
@@ -370,7 +430,7 @@ fn cmd_cllist(proxy: &mut Proxy, _args: &Args) {
         "address to"
     );
     cprint!("-----------------------------------------------------------------------\n");
-    for peer in &proxy.peers {
+    for peer in peers.iter() {
         cprint!(
             "{:6} {:<21} {:<21} {:4} {}\n",
             peer.userid,
@@ -381,7 +441,7 @@ fn cmd_cllist(proxy: &mut Proxy, _args: &Args) {
         );
     }
     cprint!("-----------------------------------------------------------------------\n");
-    cprint!("{} clients\n", proxy.peers.len());
+    cprint!("{} clients\n", peers.len());
 }
 
 #[cfg(test)]
@@ -389,38 +449,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_drop_command() {
+    fn finds_known_stringcmds_anywhere_in_the_reliable_stream() {
+        let cmds = |msg: &[u8]| stringcmds(msg).map(<[u8]>::to_vec).collect::<Vec<_>>();
+        const TMOVE: u8 = 5;
+
+        // A player leaving: drop is the only content, with or without its terminator.
         let mut msg = vec![0u8; 10];
         msg.push(CLC_STRINGCMD);
         msg.extend_from_slice(b"drop\0");
-        assert!(is_drop_command(&msg));
+        assert_eq!(cmds(&msg), [b"drop".to_vec()]);
         msg.truncate(15);
-        assert!(is_drop_command(&msg));
+        assert_eq!(cmds(&msg), [b"drop".to_vec()]);
         msg.extend_from_slice(b"ped");
-        assert!(!is_drop_command(&msg));
-        assert!(!is_drop_command(&[0u8; 11]));
-        assert!(!is_drop_command(b"short"));
+        assert_eq!(cmds(&msg), [b"dropped".to_vec()]);
+
+        // A player: setinfo right after the header, then unreliable move data.
+        let mut msg = vec![0u8; 10];
+        msg.push(CLC_STRINGCMD);
+        msg.extend_from_slice(b"setinfo \"smooth\" \"1\"\n\0");
+        msg.push(CLC_STRINGCMD);
+        msg.extend_from_slice(b"say hi\0");
+        msg.extend_from_slice(&[3, 1, 2, 3]);
+        assert_eq!(cmds(&msg), [b"setinfo \"smooth\" \"1\"\n".to_vec()]);
+
+        // A tracking spectator: a binary tmove precedes the commands.
+        let mut msg = vec![0u8; 10];
+        msg.push(TMOVE);
+        msg.extend_from_slice(&[0x10, 0x27, 0xf0, 0xd8, 0x04, 0x73]);
+        msg.push(CLC_STRINGCMD);
+        msg.extend_from_slice(b"setinfo \"smooth\" \"0\"\n\0");
+        msg.push(CLC_STRINGCMD);
+        msg.extend_from_slice(b"drop\0");
+        msg.extend_from_slice(&[3, 1, 2, 3]);
+        assert_eq!(
+            cmds(&msg),
+            [b"setinfo \"smooth\" \"0\"\n".to_vec(), b"drop".to_vec()]
+        );
+
+        // The marker is only honoured after the header, and needs the stringcmd byte.
+        assert!(cmds(b"\x04setinfo x y\0").is_empty());
+        assert!(cmds(&[&[0u8; 10][..], b"setinfo x y\0"].concat()).is_empty());
+        assert!(cmds(&[&[0u8; 10][..], b"\x04say drop\0"].concat()).is_empty());
+        assert!(cmds(&[0u8; 11]).is_empty());
+        assert!(cmds(b"short").is_empty());
     }
 
     #[tokio::test]
-    async fn lost_peer_reader_drops_the_peer() {
-        let mut proxy = Proxy::new_for_tests();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let from = "127.0.0.1:27001".parse().unwrap();
-        let index = proxy
-            .peer_new("127.0.0.1", 27500, from, b"\\name\\x", 5, Protocol::Qw)
-            .await
-            .unwrap();
-        let userid = proxy.peers[index].userid;
-
-        let lost = PeerEvent::Lost {
-            userid,
-            error: "socket gone".to_string(),
+    async fn lost_reader_marks_the_peer_for_dropping() {
+        let (events, _rx) = mpsc::channel(1);
+        let mut peers = Peers::default();
+        let registration = Registration {
+            to: "127.0.0.1:27500".parse().unwrap(),
+            from: "127.0.0.1:27001".parse().unwrap(),
+            userinfo: b"\\name\\x",
+            qport: 5,
+            proto: Protocol::Qw,
         };
-        proxy.handle_peer_event(&socket, lost);
-        assert!(proxy.peers[index].state == PeerState::Drop);
-        proxy.drop_dead_peers();
-        assert!(proxy.peers.is_empty());
+        let index = peers.register(registration, 8, &events).unwrap();
+        let userid = peers.get_index(index).unwrap().userid();
+
+        peers.lose(userid, "socket gone");
+        assert!(peers.get_index(index).unwrap().state() == PeerState::Drop);
+        peers.drop_dead();
+        assert_eq!(peers.len(), 0);
     }
 
     #[test]

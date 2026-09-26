@@ -2,6 +2,7 @@
 
 use crate::console::qstr;
 use crate::cprint;
+use crate::cvar::{self, Cvars};
 
 pub const MAX_INFO_STRING: usize = 1024;
 pub const MAX_INFO_KEY: usize = 64;
@@ -120,6 +121,7 @@ pub fn set_value_for_star_key(
     s.extend(pair.into_iter().filter(|&c| c > 13));
 }
 
+/// Like [`set_value_for_star_key`], but star keys are refused.
 pub fn set_value_for_key(
     s: &mut Vec<u8>,
     key: &[u8],
@@ -128,7 +130,6 @@ pub fn set_value_for_key(
     check_key_len: bool,
 ) {
     if key.first() == Some(&b'*') {
-        cprint!("Can't set * keys\n");
         return;
     }
     set_value_for_star_key(s, key, value, maxsize, check_key_len);
@@ -147,6 +148,37 @@ pub fn print(s: &[u8]) {
         let value_end = rest.iter().position(|&b| b == b'\\').unwrap_or(rest.len());
         cprint!("{}\n", qstr(&rest[..value_end]));
         rest = &rest[(value_end + 1).min(rest.len())..];
+    }
+}
+
+/// The proxy's serverinfo: every `SERVERINFO` cvar plus any keys set
+/// directly with the `serverinfo` console command.
+#[derive(Default)]
+pub struct ServerInfo {
+    extra: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl ServerInfo {
+    /// Sets a key that is not backed by a cvar; an empty value removes it.
+    pub fn set(&mut self, key: &[u8], value: &[u8]) {
+        self.extra.retain(|(k, _)| k != key);
+        if !value.is_empty() {
+            self.extra.push((key.to_vec(), value.to_vec()));
+        }
+    }
+
+    /// The full info string, within [`MAX_INFO_STRING`].
+    pub fn render(&self, cvars: &Cvars) -> Vec<u8> {
+        let mut out = Vec::new();
+        let cvar_pairs = cvars
+            .iter()
+            .filter(|var| var.flags & cvar::SERVERINFO != 0)
+            .map(|var| (var.name.as_bytes(), var.string.as_bytes()));
+        let extra_pairs = self.extra.iter().map(|(k, v)| (k.as_slice(), v.as_slice()));
+        for (key, value) in cvar_pairs.chain(extra_pairs) {
+            set_value_for_star_key(&mut out, key, value, MAX_INFO_STRING, true);
+        }
+        out
     }
 }
 
@@ -195,6 +227,29 @@ mod tests {
         assert_eq!(s, b"\\prx\\host");
         set_value_for_star_key(&mut s, b"*qwfwd", b"1.40", MAX_INFO_STRING, true);
         assert_eq!(s, b"\\prx\\host\\*qwfwd\\1.40");
+    }
+
+    #[test]
+    fn serverinfo_renders_flagged_cvars_and_extras() {
+        let mut cvars = Cvars::default();
+        cvars.get("*version", "v1", cvar::READONLY | cvar::SERVERINFO);
+        cvars.get("hostname", "unnamed", cvar::SERVERINFO);
+        cvars.get("developer", "1", 0);
+        let mut serverinfo = ServerInfo::default();
+        assert_eq!(
+            serverinfo.render(&cvars),
+            b"\\*version\\v1\\hostname\\unnamed"
+        );
+
+        cvars.set("hostname", "my proxy");
+        serverinfo.set(b"custom", b"yes");
+        let rendered = serverinfo.render(&cvars);
+        assert_eq!(value_for_key(&rendered, b"hostname"), b"my proxy");
+        assert_eq!(value_for_key(&rendered, b"custom"), b"yes");
+        assert_eq!(value_for_key(&rendered, b"developer"), b"");
+
+        serverinfo.set(b"custom", b"");
+        assert_eq!(value_for_key(&serverinfo.render(&cvars), b"custom"), b"");
     }
 
     #[test]
