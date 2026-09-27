@@ -66,6 +66,8 @@ pub struct Proxy {
     challenges: Challenges,
     /// Connect requests whose host is being looked up, by client address.
     lookups: HashMap<SocketAddrV4, LookupSlot>,
+    /// The smoothing cvars as last read; refreshed when one of them changes.
+    smoothing: Smoothing,
     peers: Peers,
     events: mpsc::Sender<Event>,
     reload_requested: bool,
@@ -98,8 +100,10 @@ impl Proxy {
             shell.register(name, Command::External(Handler::Peers(*cmd)));
         }
 
+        let smoothing = Smoothing::from_cvars(&shell.cvars);
         Proxy {
             shell,
+            smoothing,
             bans: Bans::default(),
             whitelist: Whitelist::default(),
             query: Query::new(),
@@ -115,10 +119,6 @@ impl Proxy {
         usize::try_from(self.shell.cvars.int("maxclients")).unwrap_or(0)
     }
 
-    fn smoothing(&self) -> Smoothing {
-        Smoothing::from_cvars(&self.shell.cvars)
-    }
-
     /// Runs buffered console commands until the buffer is empty or a `wait` is hit.
     fn execute_buffer(&mut self) {
         while let Some(line) = self.shell.cbuf.next_line() {
@@ -129,6 +129,11 @@ impl Proxy {
                 break;
             }
         }
+        // Console commands are the only way cvars change, so this is the
+        // one place the cached settings can go stale.
+        if Smoothing::cvars_modified(&mut self.shell.cvars) {
+            self.smoothing = Smoothing::from_cvars(&self.shell.cvars);
+        }
     }
 
     fn dispatch(&mut self, handler: Handler, args: &Args) {
@@ -136,7 +141,7 @@ impl Proxy {
             Handler::Bans(cmd) => cmd(&mut self.bans, &mut self.shell.cbuf, args),
             Handler::Whitelist(cmd) => cmd(&mut self.whitelist, args),
             Handler::Query(cmd) => cmd(&mut self.query, args),
-            Handler::Peers(cmd) => cmd(&self.peers, &self.smoothing(), args),
+            Handler::Peers(cmd) => cmd(&self.peers, &self.smoothing, args),
         }
     }
 
@@ -149,7 +154,7 @@ impl Proxy {
                 .insert_text(format!("exec {CONFIG_NAME}\n").as_bytes());
         }
         self.execute_buffer();
-        self.peers.flush(&self.smoothing());
+        self.peers.flush(&self.smoothing);
         self.peers.maintenance();
         self.peers.drop_dead();
         self.query.frame(
@@ -245,7 +250,7 @@ pub async fn run(params: Params) -> Result<(), String> {
             _ = hangup.recv() => proxy.reload_requested = true,
             _ = ticker.tick() => proxy.tick(&socket),
             _ = tokio::time::sleep_until(pacer_deadline.unwrap_or_else(tokio::time::Instant::now)),
-                if pacer_deadline.is_some() => proxy.peers.flush(&proxy.smoothing()),
+                if pacer_deadline.is_some() => proxy.peers.flush(&proxy.smoothing),
         }
     }
 

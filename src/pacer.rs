@@ -63,6 +63,15 @@ impl PacerConfig {
     }
 }
 
+/// What to do with a packet offered to the pacer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Push {
+    /// Send it now; the pacer took no copy.
+    Forward,
+    /// The pacer keeps a copy until its slot comes.
+    Queued,
+}
+
 struct Queued {
     arrived: Instant,
     data: Vec<u8>,
@@ -140,7 +149,9 @@ impl Pacer {
         let start = *self.period_start.get_or_insert(now);
         self.slack = Some(self.slack.map_or(wait, |slack| slack.min(wait)));
         if now.saturating_duration_since(start) >= SLACK_PERIOD {
-            self.drain += self.slack.unwrap_or_default().min(config.catchup_delay);
+            // The slack still present is what remains to drain, whatever was
+            // scheduled before; adding would count the same slack twice.
+            self.drain = self.slack.unwrap_or_default().min(config.catchup_delay);
             self.slack = None;
             self.period_start = Some(now);
         }
@@ -150,44 +161,41 @@ impl Pacer {
     /// current slot is free; otherwise it is queued for [`release`](Self::release).
     /// Without a config the packet always comes straight back, so timing is
     /// still recorded for connections that are not being smoothed.
-    pub fn push(
-        &mut self,
-        now: Instant,
-        data: Vec<u8>,
-        config: Option<&PacerConfig>,
-    ) -> Option<Vec<u8>> {
-        if self.is_duplicate(&data) {
+    pub fn push(&mut self, now: Instant, data: &[u8], config: Option<&PacerConfig>) -> Push {
+        if self.is_duplicate(data) {
             self.stats.duplicate(now);
             if self.queue.is_empty() {
-                return Some(data);
+                return Push::Forward;
             }
             self.queue.push_back(Queued {
                 arrived: now,
-                data,
+                data: data.to_vec(),
                 dupe: true,
             });
-            return None;
+            return Push::Queued;
         }
         let gap = self.stats.arrived(now);
         let Some(config) = config else {
             self.stats.sent(now, now);
-            return Some(data);
+            return Push::Forward;
         };
         if let Some(gap) = gap.filter(|gap| *gap <= config.max_delay) {
             self.rate.record(now, gap);
         }
         if self.queue.is_empty() && self.next_release.is_none_or(|due| now >= due) {
+            // The queue ran dry, so there is no slack left to drain.
+            self.drain = Duration::ZERO;
             self.next_release = Some(now + self.interval(now, config));
             self.released(now, Duration::ZERO, config);
             self.stats.sent(now, now);
-            return Some(data);
+            return Push::Forward;
         }
         self.queue.push_back(Queued {
             arrived: now,
-            data,
+            data: data.to_vec(),
             dupe: false,
         });
-        None
+        Push::Queued
     }
 
     /// Packets whose slot has come, oldest first. Stale packets are dropped first.
@@ -197,10 +205,13 @@ impl Pacer {
             .front()
             .is_some_and(|queued| now.saturating_duration_since(queued.arrived) > config.max_delay)
         {
-            let stale = self.queue.pop_front().expect("queue is not empty");
-            if !stale.dupe {
-                self.dropped += 1;
-                self.stats.dropped(now);
+            self.queue.pop_front();
+            self.dropped += 1;
+            self.stats.dropped(now);
+            // Its copies go with it: they arrived a moment later, so they may
+            // not be stale by age, but a dropped packet is not to be sent.
+            while self.queue.front().is_some_and(|queued| queued.dupe) {
+                self.queue.pop_front();
             }
         }
 
@@ -239,6 +250,7 @@ impl Pacer {
                 .mul_f64(DRAIN_SHARE)
                 .max(interval.mul_f64(DRAIN_FLOOR))
                 .min(interval.mul_f64(config.drain))
+                .min(slot / 2)
                 .min(self.drain);
             self.drain -= shave;
             // Slots are counted from when the last one was due, not from now,
@@ -273,6 +285,7 @@ impl Pacer {
         self.next_release = None;
         self.slack = None;
         self.period_start = None;
+        self.drain = Duration::ZERO;
         self.drain = Duration::ZERO;
     }
 }
@@ -328,6 +341,21 @@ impl Smoothing {
         cvars.get("smooth_drain", "10", 0);
     }
 
+    /// Whether any smoothing cvar changed since the last call; clears the flags.
+    pub fn cvars_modified(cvars: &mut Cvars) -> bool {
+        let mut modified = false;
+        for name in [
+            "smooth",
+            "smooth_interval",
+            "smooth_catchup",
+            "smooth_maxdelay",
+            "smooth_drain",
+        ] {
+            modified |= cvars.take_modified(name);
+        }
+        modified
+    }
+
     pub fn from_cvars(cvars: &Cvars) -> Self {
         Smoothing {
             policy: SmoothPolicy::from_cvar(cvars.int("smooth")),
@@ -368,15 +396,18 @@ mod tests {
         let t0 = Instant::now();
         let cfg = config();
         // Straight through: the duplicate follows without claiming a slot.
-        assert!(pacer.push(t0, numbered(1, 0), Some(&cfg)).is_some());
-        assert_eq!(
-            pacer.push(t0, numbered(1, 1), Some(&cfg)),
-            Some(numbered(1, 1))
-        );
+        assert!(pacer.push(t0, &numbered(1, 0), Some(&cfg)) == Push::Forward);
+        assert_eq!(pacer.push(t0, &numbered(1, 1), Some(&cfg)), Push::Forward);
         assert_eq!(pacer.next_deadline(), None);
         // Queued: the duplicate leaves in the same slot as the original.
-        assert_eq!(pacer.push(t0 + 6 * MS, numbered(2, 0), Some(&cfg)), None);
-        assert_eq!(pacer.push(t0 + 6 * MS, numbered(2, 1), Some(&cfg)), None);
+        assert_eq!(
+            pacer.push(t0 + 6 * MS, &numbered(2, 0), Some(&cfg)),
+            Push::Queued
+        );
+        assert_eq!(
+            pacer.push(t0 + 6 * MS, &numbered(2, 1), Some(&cfg)),
+            Push::Queued
+        );
         assert_eq!(pacer.queued(), 2);
         assert!(pacer.release(t0 + 9 * MS, &cfg).is_empty());
         assert_eq!(
@@ -384,17 +415,18 @@ mod tests {
             vec![numbered(2, 0), numbered(2, 1)]
         );
         assert_eq!(pacer.next_deadline(), None);
-        assert_eq!(pacer.push(t0 + 12 * MS, numbered(3, 0), Some(&cfg)), None);
+        assert_eq!(
+            pacer.push(t0 + 12 * MS, &numbered(3, 0), Some(&cfg)),
+            Push::Queued
+        );
         assert_eq!(pacer.release(t0 + 20 * MS, &cfg), vec![numbered(3, 0)]);
         // The reliable flag does not hide a duplicate.
         assert!(
-            pacer
-                .push(t0 + 30 * MS, numbered(4 | 0x8000_0000, 0), Some(&cfg))
-                .is_some()
+            pacer.push(t0 + 30 * MS, &numbered(4 | 0x8000_0000, 0), Some(&cfg)) == Push::Forward
         );
         assert_eq!(
-            pacer.push(t0 + 30 * MS, numbered(4, 1), Some(&cfg)),
-            Some(numbered(4, 1))
+            pacer.push(t0 + 30 * MS, &numbered(4, 1), Some(&cfg)),
+            Push::Forward
         );
         // Only originals count as packets, in the gap statistics and as drops.
         let now = t0 + 30 * MS;
@@ -402,22 +434,107 @@ mod tests {
         assert_eq!(pacer.stats.recent_dupes(now), 3);
         assert_eq!(pacer.stats.arrival_gap.summary(now).count, 3);
         assert_eq!(pacer.stats.send_gap.summary(now).count, 3);
-        assert_eq!(pacer.push(t0 + 35 * MS, numbered(5, 0), Some(&cfg)), None);
-        assert_eq!(pacer.push(t0 + 35 * MS, numbered(5, 1), Some(&cfg)), None);
+        assert_eq!(
+            pacer.push(t0 + 35 * MS, &numbered(5, 0), Some(&cfg)),
+            Push::Queued
+        );
+        assert_eq!(
+            pacer.push(t0 + 35 * MS, &numbered(5, 1), Some(&cfg)),
+            Push::Queued
+        );
         assert!(pacer.release(t0 + 300 * MS, &cfg).is_empty());
         assert_eq!(pacer.dropped, 1);
         assert_eq!(pacer.stats.recent_drops(t0 + 300 * MS), 1);
     }
 
     #[test]
+    fn a_dropped_packet_takes_its_copies_with_it() {
+        let mut pacer = Pacer::default();
+        let t0 = Instant::now();
+        let cfg = config();
+        assert_eq!(pacer.push(t0, &numbered(1, 0), Some(&cfg)), Push::Forward);
+        // Original and copy a moment apart, both queued behind the slot.
+        assert_eq!(
+            pacer.push(t0 + 5 * MS, &numbered(2, 0), Some(&cfg)),
+            Push::Queued
+        );
+        let copy_at = t0 + 5 * MS + Duration::from_micros(50);
+        assert_eq!(
+            pacer.push(copy_at, &numbered(2, 1), Some(&cfg)),
+            Push::Queued
+        );
+        // Nothing runs until the original is just past the age limit; the
+        // copy is not, but it must not be sent on its own.
+        let late = t0 + 5 * MS + cfg.max_delay + Duration::from_micros(20);
+        assert!(pacer.release(late, &cfg).is_empty());
+        assert_eq!(pacer.queued(), 0);
+        assert_eq!(pacer.dropped, 1);
+        assert_eq!(pacer.next_deadline(), None);
+    }
+
+    #[test]
+    fn draining_never_moves_a_release_earlier_than_the_last() {
+        // A large pending drain and a drain cap of a whole slot: in catch-up
+        // mode the shave is still held under half a slot.
+        let cfg = PacerConfig::new(10.0, 20, 1000, 100.0);
+        let mut pacer = Pacer::default();
+        let t0 = Instant::now();
+        assert_eq!(pacer.push(t0, &packet(0), Some(&cfg)), Push::Forward);
+        for id in 1..=20 {
+            assert_eq!(pacer.push(t0, &packet(id), Some(&cfg)), Push::Queued);
+        }
+        pacer.drain = 100 * MS;
+
+        let mut previous = t0;
+        let mut t = t0;
+        while pacer.queued() > 0 {
+            t += Duration::from_micros(500);
+            let released = pacer.release(t, &cfg);
+            if released.len() > 1 {
+                panic!(
+                    "{} packets released in one go at {:?}",
+                    released.len(),
+                    t - t0
+                );
+            }
+            if !released.is_empty() {
+                assert!(
+                    t - previous >= Duration::from_micros(2500),
+                    "gap {:?}",
+                    t - previous
+                );
+                previous = t;
+            }
+        }
+    }
+
+    #[test]
+    fn slack_is_replaced_each_period_and_forgotten_when_the_queue_runs_dry() {
+        let cfg = config();
+        let mut pacer = Pacer::default();
+        let t0 = Instant::now();
+        // Two periods each seeing 5 ms of slack schedule 5 ms, not 10.
+        pacer.released(t0, 5 * MS, &cfg);
+        pacer.released(t0 + SLACK_PERIOD, 5 * MS, &cfg);
+        assert_eq!(pacer.drain, 5 * MS);
+        pacer.released(t0 + SLACK_PERIOD + MS, 5 * MS, &cfg);
+        pacer.released(t0 + 2 * SLACK_PERIOD + MS, 5 * MS, &cfg);
+        assert_eq!(pacer.drain, 5 * MS);
+        // A packet passing straight through means there is no slack left.
+        let t = t0 + 3 * SLACK_PERIOD;
+        assert_eq!(pacer.push(t, &packet(1), Some(&cfg)), Push::Forward);
+        assert_eq!(pacer.drain, Duration::ZERO);
+    }
+
+    #[test]
     fn duplicates_pass_unsmoothed_and_are_counted() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert_eq!(pacer.push(t0, numbered(7, 0), None), Some(numbered(7, 0)));
-        assert_eq!(pacer.push(t0, numbered(7, 1), None), Some(numbered(7, 1)));
+        assert_eq!(pacer.push(t0, &numbered(7, 0), None), Push::Forward);
+        assert_eq!(pacer.push(t0, &numbered(7, 1), None), Push::Forward);
         assert_eq!(
-            pacer.push(t0 + 13 * MS, numbered(8, 0), None),
-            Some(numbered(8, 0))
+            pacer.push(t0 + 13 * MS, &numbered(8, 0), None),
+            Push::Forward
         );
         let now = t0 + 13 * MS;
         assert_eq!(pacer.stats.recent_arrivals(now), 2);
@@ -430,14 +547,14 @@ mod tests {
     fn packets_on_schedule_pass_straight_through() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert_eq!(pacer.push(t0, packet(1), Some(&config())), Some(packet(1)));
+        assert_eq!(pacer.push(t0, &packet(1), Some(&config())), Push::Forward);
         assert_eq!(
-            pacer.push(t0 + 10 * MS, packet(2), Some(&config())),
-            Some(packet(2))
+            pacer.push(t0 + 10 * MS, &packet(2), Some(&config())),
+            Push::Forward
         );
         assert_eq!(
-            pacer.push(t0 + 25 * MS, packet(3), Some(&config())),
-            Some(packet(3))
+            pacer.push(t0 + 25 * MS, &packet(3), Some(&config())),
+            Push::Forward
         );
         assert_eq!(pacer.queued(), 0);
         assert_eq!(pacer.next_deadline(), None);
@@ -447,14 +564,20 @@ mod tests {
     fn early_packet_waits_for_its_slot() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert!(pacer.push(t0, packet(1), Some(&config())).is_some());
+        assert!(pacer.push(t0, &packet(1), Some(&config())) == Push::Forward);
         // Arrives 4 ms early: held until the slot at t0 + 10 ms.
-        assert_eq!(pacer.push(t0 + 6 * MS, packet(2), Some(&config())), None);
+        assert_eq!(
+            pacer.push(t0 + 6 * MS, &packet(2), Some(&config())),
+            Push::Queued
+        );
         assert_eq!(pacer.next_deadline(), Some(t0 + 10 * MS));
         assert!(pacer.release(t0 + 9 * MS, &config()).is_empty());
         assert_eq!(pacer.release(t0 + 10 * MS, &config()), vec![packet(2)]);
         // The line stays paced relative to the previous release.
-        assert_eq!(pacer.push(t0 + 12 * MS, packet(3), Some(&config())), None);
+        assert_eq!(
+            pacer.push(t0 + 12 * MS, &packet(3), Some(&config())),
+            Push::Queued
+        );
         assert_eq!(pacer.release(t0 + 20 * MS, &config()), vec![packet(3)]);
     }
 
@@ -462,9 +585,9 @@ mod tests {
     fn burst_is_spread_and_catch_up_doubles_the_rate() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert!(pacer.push(t0, packet(0), Some(&config())).is_some());
+        assert!(pacer.push(t0, &packet(0), Some(&config())) == Push::Forward);
         for id in 1..=12 {
-            assert_eq!(pacer.push(t0, packet(id), Some(&config())), None);
+            assert_eq!(pacer.push(t0, &packet(id), Some(&config())), Push::Queued);
         }
 
         let mut releases = Vec::new();
@@ -501,11 +624,14 @@ mod tests {
     fn stale_packets_are_dropped_oldest_first() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert!(pacer.push(t0, packet(0), Some(&config())).is_some());
+        assert!(pacer.push(t0, &packet(0), Some(&config())) == Push::Forward);
         for id in 1..=3 {
-            assert_eq!(pacer.push(t0, packet(id), Some(&config())), None);
+            assert_eq!(pacer.push(t0, &packet(id), Some(&config())), Push::Queued);
         }
-        assert_eq!(pacer.push(t0 + 100 * MS, packet(4), Some(&config())), None);
+        assert_eq!(
+            pacer.push(t0 + 100 * MS, &packet(4), Some(&config())),
+            Push::Queued
+        );
 
         // Nothing was released for 250 ms: the t0 packets are stale, the later one is not.
         assert_eq!(pacer.release(t0 + 250 * MS, &config()), vec![packet(4)]);
@@ -517,9 +643,9 @@ mod tests {
     fn drain_returns_everything_in_order() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert!(pacer.push(t0, packet(0), Some(&config())).is_some());
-        pacer.push(t0, packet(1), Some(&config()));
-        pacer.push(t0, packet(2), Some(&config()));
+        assert!(pacer.push(t0, &packet(0), Some(&config())) == Push::Forward);
+        pacer.push(t0, &packet(1), Some(&config()));
+        pacer.push(t0, &packet(2), Some(&config()));
         assert_eq!(pacer.drain(t0), vec![packet(1), packet(2)]);
         assert_eq!(pacer.next_deadline(), None);
     }
@@ -528,14 +654,14 @@ mod tests {
     fn clear_discards_queue_and_slot_but_keeps_stats() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert!(pacer.push(t0, packet(0), Some(&config())).is_some());
-        assert_eq!(pacer.push(t0, packet(1), Some(&config())), None);
+        assert!(pacer.push(t0, &packet(0), Some(&config())) == Push::Forward);
+        assert_eq!(pacer.push(t0, &packet(1), Some(&config())), Push::Queued);
         pacer.clear();
         assert_eq!(pacer.queued(), 0);
         assert_eq!(pacer.next_deadline(), None);
         assert_eq!(
-            pacer.push(t0 + MS, packet(2), Some(&config())),
-            Some(packet(2))
+            pacer.push(t0 + MS, &packet(2), Some(&config())),
+            Push::Forward
         );
         assert_eq!(pacer.stats.arrival_gap.summary(t0 + MS).count, 2);
     }
@@ -575,9 +701,9 @@ mod tests {
     fn unsmoothed_packets_pass_through_but_are_measured() {
         let mut pacer = Pacer::default();
         let t0 = Instant::now();
-        assert_eq!(pacer.push(t0, packet(1), None), Some(packet(1)));
-        assert_eq!(pacer.push(t0, packet(2), None), Some(packet(2)));
-        assert_eq!(pacer.push(t0 + 20 * MS, packet(3), None), Some(packet(3)));
+        assert_eq!(pacer.push(t0, &packet(1), None), Push::Forward);
+        assert_eq!(pacer.push(t0, &packet(2), None), Push::Forward);
+        assert_eq!(pacer.push(t0 + 20 * MS, &packet(3), None), Push::Forward);
         let gaps = pacer.stats.arrival_gap.summary(t0 + 20 * MS);
         assert_eq!(gaps.count, 2);
         assert!((gaps.max - 20.0).abs() < 1e-9);
@@ -614,7 +740,7 @@ mod tests {
             if arrival >= end {
                 break;
             }
-            if pacer.push(arrival, vec![id], Some(cfg)).is_some() {
+            if pacer.push(arrival, &[id], Some(cfg)) == Push::Forward {
                 sends.push(arrival);
             }
             id = id.wrapping_add(1);
@@ -637,24 +763,24 @@ mod tests {
         let t0 = Instant::now();
         let mut t = t0;
         for id in 0..MIN_RATE_SAMPLES as u8 {
-            pacer.push(t, packet(id), Some(&cfg));
+            pacer.push(t, &packet(id), Some(&cfg));
             t += 40 * MS;
         }
         // 31 gaps so far: still the configured interval.
         assert_eq!(pacer.interval(t, &cfg), 13 * MS);
-        pacer.push(t, packet(200), Some(&cfg));
+        pacer.push(t, &packet(200), Some(&cfg));
         let measured = pacer.interval(t, &cfg).as_secs_f64() * 1000.0;
         assert!((measured - 40.0 * RATE_MARGIN).abs() < 1e-6, "{measured}");
         // A stall is not a rate signal.
         t += 500 * MS;
-        pacer.push(t, packet(201), Some(&cfg));
+        pacer.push(t, &packet(201), Some(&cfg));
         let measured = pacer.interval(t, &cfg).as_secs_f64() * 1000.0;
         assert!((measured - 40.0 * RATE_MARGIN).abs() < 1e-6, "{measured}");
 
         // Neither is a burst: 32 gaps of nothing leave the configured interval in place.
         let mut pacer = Pacer::default();
         for id in 0..=MIN_RATE_SAMPLES as u8 {
-            pacer.push(t0, packet(id), Some(&cfg));
+            pacer.push(t0, &packet(id), Some(&cfg));
         }
         assert_eq!(pacer.interval(t0, &cfg), 13 * MS);
     }
@@ -699,9 +825,9 @@ mod tests {
         let t0 = Instant::now();
 
         // A stall delivers four packets at once, then the client is steady.
-        assert!(pacer.push(t0, packet(0), Some(&cfg)).is_some());
+        assert!(pacer.push(t0, &packet(0), Some(&cfg)) == Push::Forward);
         for id in 1..4 {
-            assert_eq!(pacer.push(t0, packet(id), Some(&cfg)), None);
+            assert_eq!(pacer.push(t0, &packet(id), Some(&cfg)), Push::Queued);
         }
         let client_interval = Duration::from_secs_f64(1.0 / 77.0);
         let mut t = t0;
@@ -711,7 +837,7 @@ mod tests {
             while let Some(due) = pacer.next_deadline().filter(|due| *due <= t) {
                 pacer.release(due, &cfg);
             }
-            pacer.push(t, vec![id], Some(&cfg));
+            pacer.push(t, &[id], Some(&cfg));
             if pacer.queued() == 0 && empty_at.is_none() {
                 empty_at = Some(t - t0);
             }

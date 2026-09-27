@@ -61,7 +61,8 @@ of its own.
 
 The ``smooth`` cvar sets who gets smoothed: ``0`` nobody, ``1`` (default)
 clients that opt in with ``setinfo smooth 1``, ``2`` everyone except clients
-that set ``setinfo smooth 0``. Clients can change the setting at any time,
+that set ``setinfo smooth 0``. Only QuakeWorld clients are smoothed; Quake III
+traffic is passed straight through. Clients can change the setting at any time,
 also while connected; it takes effect on the next packet.
 
 ``clstats`` shows, per client over the last 5 seconds, the average, standard

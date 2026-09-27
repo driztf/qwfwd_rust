@@ -79,26 +79,10 @@ pub struct LinkStats {
     pub arrival_gap: Series,
     pub send_gap: Series,
     pub wait: Series,
-    arrivals: VecDeque<Instant>,
-    dupes: VecDeque<Instant>,
-    drops: VecDeque<Instant>,
-}
-
-/// Drops timestamps older than the window from the front of a queue.
-fn prune(times: &mut VecDeque<Instant>, now: Instant) {
-    while times
-        .front()
-        .is_some_and(|at| now.saturating_duration_since(*at) > WINDOW)
-    {
-        times.pop_front();
-    }
-}
-
-fn count_recent(times: &VecDeque<Instant>, now: Instant) -> usize {
-    times
-        .iter()
-        .filter(|at| now.saturating_duration_since(**at) <= WINDOW)
-        .count()
+    /// Only the counts of these matter.
+    arrivals: Series,
+    dupes: Series,
+    drops: Series,
 }
 
 impl LinkStats {
@@ -111,26 +95,24 @@ impl LinkStats {
             self.arrival_gap.record(now, gap);
         }
         self.last_arrival = Some(now);
-        prune(&mut self.arrivals, now);
-        self.arrivals.push_back(now);
+        self.arrivals.record(now, Duration::ZERO);
         gap
     }
 
     /// Packets that arrived within the window.
     pub fn recent_arrivals(&self, now: Instant) -> usize {
-        count_recent(&self.arrivals, now)
+        self.arrivals.mean(now).0
     }
 
     /// A copy of the previous packet arrived; it is not a packet in its own
     /// right and leaves the gap statistics alone.
     pub fn duplicate(&mut self, now: Instant) {
-        prune(&mut self.dupes, now);
-        self.dupes.push_back(now);
+        self.dupes.record(now, Duration::ZERO);
     }
 
     /// Duplicates that arrived within the window.
     pub fn recent_dupes(&self, now: Instant) -> usize {
-        count_recent(&self.dupes, now)
+        self.dupes.mean(now).0
     }
 
     /// A packet that arrived at `arrived` was forwarded at `now`.
@@ -145,13 +127,12 @@ impl LinkStats {
     }
 
     pub fn dropped(&mut self, now: Instant) {
-        prune(&mut self.drops, now);
-        self.drops.push_back(now);
+        self.drops.record(now, Duration::ZERO);
     }
 
     /// Drops within the window.
     pub fn recent_drops(&self, now: Instant) -> usize {
-        count_recent(&self.drops, now)
+        self.drops.mean(now).0
     }
 }
 

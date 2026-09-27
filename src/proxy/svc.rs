@@ -117,9 +117,8 @@ impl Proxy {
             return;
         }
 
-        let smoothing = self.smoothing();
         self.peers
-            .forward_from_client(from, msg, connectionless, &smoothing);
+            .forward_from_client(from, msg, connectionless, &self.smoothing);
     }
 
     /// Handles an out-of-band packet from a client. Returns whether the packet

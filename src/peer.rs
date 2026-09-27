@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use crate::cmd::Args;
 use crate::console::qstr;
 use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
-use crate::pacer::{Pacer, Smoothing};
+use crate::pacer::{Pacer, Push, Smoothing};
 use crate::protocol::{CLC_STRINGCMD, NETCHAN_HEADER};
 use crate::proxy::Event;
 use crate::{cprint, dprint, info, net, parse};
@@ -136,6 +136,29 @@ impl Peer {
 
     pub fn minutes_connected(&self) -> u64 {
         self.connected_at.elapsed().as_secs() / 60
+    }
+
+    /// Whether this peer's packets are paced. Only QuakeWorld traffic is:
+    /// the pacer's rate and duplicate detection assume its netchan.
+    pub fn smoothed(&self, smoothing: &Smoothing) -> bool {
+        self.proto == Protocol::Qw && smoothing.policy.applies_to(&self.userinfo)
+    }
+
+    fn send_all(&self, packets: Vec<Vec<u8>>) {
+        for data in packets {
+            net::send(&self.socket, &data, self.to);
+        }
+    }
+
+    /// Sends whatever the pacer lets go at `now`: the packets whose slot has
+    /// come when smoothed, everything queued otherwise.
+    fn service(&mut self, now: Instant, smoothing: &Smoothing) {
+        let ready = if self.smoothed(smoothing) {
+            self.upstream.release(now, &smoothing.config)
+        } else {
+            self.upstream.drain(now)
+        };
+        self.send_all(ready);
     }
 }
 
@@ -318,9 +341,8 @@ impl Peers {
                 }
             }
             if dropping {
-                for queued in peer.upstream.drain(now) {
-                    net::send(&peer.socket, &queued, peer.to);
-                }
+                let queued = peer.upstream.drain(now);
+                peer.send_all(queued);
                 // The client is leaving; repeat so the server hears it despite packet loss.
                 for _ in 0..3 {
                     net::send(&peer.socket, msg, peer.to);
@@ -328,15 +350,14 @@ impl Peers {
             } else if connectionless {
                 net::send(&peer.socket, msg, peer.to);
             } else {
-                let smoothed = smoothing.policy.applies_to(&peer.userinfo);
+                let smoothed = peer.smoothed(smoothing);
                 if !smoothed {
-                    for queued in peer.upstream.drain(now) {
-                        net::send(&peer.socket, &queued, peer.to);
-                    }
+                    let queued = peer.upstream.drain(now);
+                    peer.send_all(queued);
                 }
                 let config = smoothed.then_some(&smoothing.config);
-                if let Some(data) = peer.upstream.push(now, msg.to_vec(), config) {
-                    net::send(&peer.socket, &data, peer.to);
+                if peer.upstream.push(now, msg, config) == Push::Forward {
+                    net::send(&peer.socket, msg, peer.to);
                 }
             }
         }
@@ -436,21 +457,17 @@ impl Peers {
             .iter_mut()
             .filter(|p| p.state == PeerState::Connected)
         {
-            let ready = if smoothing.policy.applies_to(&peer.userinfo) {
-                peer.upstream.release(now, &smoothing.config)
-            } else {
-                peer.upstream.drain(now)
-            };
-            for data in ready {
-                net::send(&peer.socket, &data, peer.to);
-            }
+            peer.service(now, smoothing);
         }
     }
 
-    /// When the earliest queued packet is due, if any.
+    /// When the earliest queued packet of a connected peer is due, if any.
+    /// Only connected peers are flushed, so only they may set the deadline;
+    /// a peer on its way out would otherwise wake the loop without end.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.list
             .iter()
+            .filter(|p| p.state == PeerState::Connected)
             .filter_map(|p| p.upstream.next_deadline())
             .min()
     }
@@ -545,7 +562,7 @@ fn cmd_clstats(peers: &Peers, smoothing: &Smoothing, _args: &Args) {
             "{:6} {:<15} {:^6} {:5} {:5} {:5.1}/{:4.1}/{:5.1}  {:5.1}/{:4.1}/{:5.1}  {:5.1}/{:5.1}  {:5} {:5}\n",
             peer.userid,
             qstr(&peer.name),
-            if smoothing.policy.applies_to(&peer.userinfo) {
+            if peer.smoothed(smoothing) {
                 "on"
             } else {
                 "off"
@@ -650,6 +667,40 @@ mod tests {
         assert!(peer.state() == PeerState::Challenge);
         peers.drop_dead();
         assert_eq!(peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_peer_on_its_way_out_sets_no_deadline() {
+        use crate::pacer::PacerConfig;
+
+        let (events, _rx) = mpsc::channel(1);
+        let mut peers = Peers::default();
+        let registration = Registration {
+            to: "127.0.0.1:27500".parse().unwrap(),
+            from: "127.0.0.1:27001".parse().unwrap(),
+            userinfo: b"\\name\\x",
+            qport: 5,
+            proto: Protocol::Qw,
+        };
+        let index = peers.register(registration, 8, &events).unwrap();
+        peers.list[index].state = PeerState::Connected;
+
+        // A packet waiting for its slot sets a deadline while the peer is connected.
+        let cfg = PacerConfig::new(10.0, 50, 200, 10.0);
+        let now = Instant::now();
+        assert_eq!(
+            peers.list[index].upstream.push(now, &[1], Some(&cfg)),
+            Push::Forward
+        );
+        assert_eq!(
+            peers.list[index].upstream.push(now, &[2], Some(&cfg)),
+            Push::Queued
+        );
+        assert!(peers.next_deadline().is_some());
+
+        let userid = peers.list[index].userid;
+        peers.lose(userid, "socket gone");
+        assert_eq!(peers.next_deadline(), None);
     }
 
     #[test]
