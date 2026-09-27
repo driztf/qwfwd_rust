@@ -14,6 +14,7 @@ mod protocol;
 mod proxy;
 mod query;
 mod stats;
+mod timer;
 
 mod whitelist;
 
