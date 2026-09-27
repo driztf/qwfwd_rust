@@ -2,7 +2,7 @@ name: build targets
 on: [pull_request]
 jobs:
   build:
-    if: github.repository == 'QW-Group/qwfwd'
+    if: github.repository == 'driztf/qwfwd_rust'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
