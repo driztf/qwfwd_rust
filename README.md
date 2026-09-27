@@ -39,8 +39,10 @@ qwfwd [port [ip]] [+command ...]
 
 The proxy reads ``qwfwd/qwfwd.cfg`` (see [the example config](resources/example-configs/qwfwd.cfg))
 and ``qwfwd_listip.cfg`` on startup; ``+set hostname "my proxy"`` style arguments run after the
-config. When attached to a terminal the console accepts commands on stdin, and ``SIGHUP``
-reloads ``qwfwd.cfg``. Run ``cmdlist`` and ``cvarlist`` in the console for the full list.
+config. When attached to a terminal the console accepts commands on stdin with line editing
+(arrow keys move through history and along the line, Home/End, Ctrl-A/E and the usual
+readline bindings; Ctrl-C quits), and ``SIGHUP`` reloads ``qwfwd.cfg``. Run ``cmdlist`` and
+``cvarlist`` in the console for the full list.
 
 ## Development
 

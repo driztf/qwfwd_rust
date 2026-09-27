@@ -6,12 +6,12 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cmd::Args;
+use crate::cmd::{Args, Cbuf};
 use crate::console::{developer, qstr};
-use crate::proxy::Proxy;
 use crate::{cprint, dprint, parse};
 
-const LISTIP_NAME: &str = "qwfwd_listip.cfg";
+/// Where `writeip` persists the filters; loaded at startup.
+pub const LISTIP_NAME: &str = "qwfwd_listip.cfg";
 const MAX_IPFILTERS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,7 +23,7 @@ pub enum FilterKind {
 impl FilterKind {
     fn label(self) -> &'static str {
         match self {
-            FilterKind::Ban => " ban",
+            FilterKind::Ban => "ban",
             FilterKind::Safe => "safe",
         }
     }
@@ -33,8 +33,8 @@ impl FilterKind {
 struct IpFilter {
     compare: [u8; 4],
     mask: [u8; 4],
-    /// Unix time of expiry; zero means permanent.
-    expires: f64,
+    /// Unix time of expiry; `None` is permanent.
+    expires: Option<f64>,
     kind: FilterKind,
 }
 
@@ -110,7 +110,8 @@ impl Bans {
 
     pub fn clean_expired(&mut self) {
         let now = unix_now();
-        self.filters.retain(|f| f.expires == 0.0 || f.expires > now);
+        self.filters
+            .retain(|f| f.expires.is_none_or(|expires| expires > now));
     }
 
     fn can_add_ban(&self, filter: &IpFilter) -> bool {
@@ -129,50 +130,48 @@ impl Bans {
             .enumerate()
             .filter(|(_, f)| f.kind == kind)
         {
-            let expiry = if f.expires != 0.0 {
-                let mut left = (f.expires - now) as i64;
-                let days = left / 86_400;
-                left -= days * 86_400;
-                let hours = left / 3_600;
-                left -= hours * 3_600;
-                let minutes = left / 60;
-                let seconds = left - minutes * 60;
-                if days != 0 {
-                    format!("|{days:4}d:{hours:2}h")
-                } else if hours != 0 {
-                    format!("|{hours:4}h:{minutes:2}m")
-                } else {
-                    format!("|{minutes:4}m:{seconds:2}s")
+            let expiry = match f.expires {
+                Some(expires) => {
+                    let mut left = (expires - now) as i64;
+                    let days = left / 86_400;
+                    left -= days * 86_400;
+                    let hours = left / 3_600;
+                    left -= hours * 3_600;
+                    let minutes = left / 60;
+                    let seconds = left - minutes * 60;
+                    if days != 0 {
+                        format!("|{days:4}d:{hours:2}h")
+                    } else if hours != 0 {
+                        format!("|{hours:4}h:{minutes:2}m")
+                    } else {
+                        format!("|{minutes:4}m:{seconds:2}s")
+                    }
                 }
-            } else {
-                "|permanent".to_owned()
+                None => "|permanent".to_owned(),
             };
-            cprint!("{i:3}|{}|{}{expiry}\n", padded_ip(f.ip()), f.kind.label());
+            cprint!(
+                "{i:3}|{}|{:>4}{expiry}\n",
+                padded_ip(f.ip()),
+                f.kind.label()
+            );
         }
     }
 }
 
-impl Proxy {
-    pub fn register_ban_commands(&mut self) {
-        self.cmds.register("addip", cmd_addip);
-        self.cmds.register("removeip", cmd_removeip);
-        self.cmds.register("listip", cmd_listip);
-        self.cmds.register("writeip", cmd_writeip);
-        self.cmds.register("banip", cmd_banip);
-        self.cmds.register("banremove", cmd_banremove);
-        self.cmds.register("banlist", cmd_banlist);
-    }
+/// A ban command; the command buffer lets `banip` queue a `writeip`.
+pub type Cmd = fn(&mut Bans, &mut Cbuf, &Args);
 
-    /// Loads the persisted ban list.
-    pub fn ban_init(&mut self) {
-        self.cmds
-            .cbuf
-            .insert_text(format!("exec {LISTIP_NAME}\n").as_bytes());
-        self.execute_buffer();
-    }
-}
+pub const COMMANDS: &[(&str, Cmd)] = &[
+    ("addip", cmd_addip),
+    ("removeip", cmd_removeip),
+    ("listip", cmd_listip),
+    ("writeip", cmd_writeip),
+    ("banip", cmd_banip),
+    ("banremove", cmd_banremove),
+    ("banlist", cmd_banlist),
+];
 
-fn cmd_addip(proxy: &mut Proxy, args: &Args) {
+fn cmd_addip(bans: &mut Bans, _cbuf: &mut Cbuf, args: &Args) {
     let Some((compare, mask)) = parse_filter(args.arg(1)).filter(|(c, _)| *c != [0; 4]) else {
         cprint!("Bad filter address: {}\n", qstr(args.arg(1)));
         return;
@@ -187,13 +186,14 @@ fn cmd_addip(proxy: &mut Proxy, args: &Args) {
         }
     };
 
-    // "+10" bans for ten seconds from now; a bare number is an absolute unix time.
+    // "+10" bans for ten seconds from now (so "+0" expires at once); a bare
+    // number is an absolute unix time, and a bare 0 (what writeip records
+    // for permanent bans) means no expiry.
     let when = args.arg(3);
-    let (base, when) = match when.strip_prefix(b"+") {
-        Some(relative) => (unix_now(), relative),
-        None => (0.0, when),
+    let expires = match when.strip_prefix(b"+") {
+        Some(relative) => parse::float_prefix(relative).map(|t| t + unix_now()),
+        None => parse::float_prefix(when).filter(|&t| t != 0.0),
     };
-    let expires = parse::float_prefix(when).map_or(0.0, |t| t + base);
 
     let filter = IpFilter {
         compare,
@@ -201,7 +201,7 @@ fn cmd_addip(proxy: &mut Proxy, args: &Args) {
         expires,
         kind,
     };
-    let filters = &mut proxy.bans.filters;
+    let filters = &mut bans.filters;
     match filters.iter().position(|f| f.same_rule(&filter)) {
         Some(i) => filters[i] = filter,
         None if filters.len() >= MAX_IPFILTERS => cprint!("IP filter list is full\n"),
@@ -209,53 +209,49 @@ fn cmd_addip(proxy: &mut Proxy, args: &Args) {
     }
 }
 
-fn cmd_removeip(proxy: &mut Proxy, args: &Args) {
+fn cmd_removeip(bans: &mut Bans, _cbuf: &mut Cbuf, args: &Args) {
     let Some((compare, mask)) = parse_filter(args.arg(1)) else {
         cprint!("Bad filter address: {}\n", qstr(args.arg(1)));
         return;
     };
-    match proxy
-        .bans
+    match bans
         .filters
         .iter()
         .position(|f| f.mask == mask && f.compare == compare)
     {
         Some(i) => {
-            proxy.bans.filters.remove(i);
+            bans.filters.remove(i);
             cprint!("Removed.\n");
         }
         None => cprint!("Didn't find {}.\n", qstr(args.arg(1))),
     }
 }
 
-fn cmd_listip(proxy: &mut Proxy, _args: &Args) {
+fn cmd_listip(bans: &mut Bans, _cbuf: &mut Cbuf, _args: &Args) {
     let now = unix_now();
     cprint!("Filter list:\n");
-    for f in &proxy.bans.filters {
-        let expiry = if f.expires != 0.0 {
-            format!(" | {} s", (f.expires - now) as i64)
-        } else {
-            String::new()
-        };
-        cprint!("{} | {}{expiry}\n", padded_ip(f.ip()), f.kind.label());
+    for f in &bans.filters {
+        let expiry = f.expires.map_or(String::new(), |expires| {
+            format!(" | {} s", (expires - now) as i64)
+        });
+        cprint!("{} | {:>4}{expiry}\n", padded_ip(f.ip()), f.kind.label());
     }
 }
 
-fn cmd_writeip(proxy: &mut Proxy, _args: &Args) {
+fn cmd_writeip(bans: &mut Bans, _cbuf: &mut Cbuf, _args: &Args) {
     cprint!("Writing {LISTIP_NAME}.\n");
     let safe_first = |f: &&IpFilter| f.kind == FilterKind::Safe;
-    let contents: String = proxy
-        .bans
+    let contents: String = bans
         .filters
         .iter()
         .filter(safe_first)
-        .chain(proxy.bans.filters.iter().filter(|f| !safe_first(f)))
+        .chain(bans.filters.iter().filter(|f| !safe_first(f)))
         .map(|f| {
             format!(
                 "addip {} {} {:.0}\n",
                 f.ip(),
-                f.kind.label().trim_start(),
-                f.expires
+                f.kind.label(),
+                f.expires.unwrap_or(0.0)
             )
         })
         .collect();
@@ -264,7 +260,7 @@ fn cmd_writeip(proxy: &mut Proxy, _args: &Args) {
     }
 }
 
-fn cmd_banip(proxy: &mut Proxy, args: &Args) {
+fn cmd_banip(bans: &mut Bans, cbuf: &mut Cbuf, args: &Args) {
     if args.argc() < 3 {
         cprint!("usage: {} <ip> <time<s m h d>>\n", args.arg_str(0));
         return;
@@ -276,10 +272,10 @@ fn cmd_banip(proxy: &mut Proxy, args: &Args) {
     let filter = IpFilter {
         compare,
         mask,
-        expires: 0.0,
+        expires: None,
         kind: FilterKind::Ban,
     };
-    if !proxy.bans.can_add_ban(&filter) {
+    if !bans.can_add_ban(&filter) {
         cprint!("ban: can't ban such ip: {}\n", qstr(args.arg(1)));
         return;
     }
@@ -313,24 +309,18 @@ fn cmd_banip(proxy: &mut Proxy, args: &Args) {
         unit[0] as char
     );
     let plus = if seconds != 0 { "+" } else { "" };
-    proxy
-        .cmds
-        .cbuf
-        .add_text(format!("addip {} ban {plus}{seconds}\n", filter.ip()).as_bytes());
-    proxy.cmds.cbuf.add_text(b"writeip\n");
+    cbuf.add_text(format!("addip {} ban {plus}{seconds}\n", filter.ip()).as_bytes());
+    cbuf.add_text(b"writeip\n");
 }
 
-fn cmd_banremove(proxy: &mut Proxy, args: &Args) {
+fn cmd_banremove(bans: &mut Bans, cbuf: &mut Cbuf, args: &Args) {
     if args.argc() < 2 {
         cprint!("usage: {} [banid]\n", args.arg_str(0));
-        cmd_banlist(proxy, args);
+        cmd_banlist(bans, cbuf, args);
         return;
     }
     let id = parse::atoi(args.arg(1));
-    let Some(filter) = usize::try_from(id)
-        .ok()
-        .and_then(|i| proxy.bans.filters.get(i))
-    else {
+    let Some(filter) = usize::try_from(id).ok().and_then(|i| bans.filters.get(i)) else {
         cprint!("Wrong ban id: {id}\n");
         return;
     };
@@ -339,12 +329,12 @@ fn cmd_banremove(proxy: &mut Proxy, args: &Args) {
         return;
     }
     cprint!("{} was unbanned\n", padded_ip(filter.ip()));
-    proxy.bans.filters.remove(id as usize);
-    proxy.cmds.cbuf.add_text(b"writeip\n");
+    bans.filters.remove(id as usize);
+    cbuf.add_text(b"writeip\n");
 }
 
-fn cmd_banlist(proxy: &mut Proxy, _args: &Args) {
-    if proxy.bans.filters.is_empty() {
+fn cmd_banlist(bans: &mut Bans, _cbuf: &mut Cbuf, _args: &Args) {
+    if bans.filters.is_empty() {
         cprint!("Ban list: empty\n");
         return;
     }
@@ -356,8 +346,8 @@ fn cmd_banlist(proxy: &mut Proxy, _args: &Args) {
         "type",
         "expire"
     );
-    proxy.bans.list(FilterKind::Safe);
-    proxy.bans.list(FilterKind::Ban);
+    bans.list(FilterKind::Safe);
+    bans.list(FilterKind::Ban);
 }
 
 #[cfg(test)]
@@ -366,6 +356,16 @@ mod tests {
 
     fn addr(ip: [u8; 4]) -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::from(ip), 27500)
+    }
+
+    fn run(bans: &mut Bans, cbuf: &mut Cbuf, line: &[u8]) {
+        let args = Args::tokenize(line);
+        let name = args.arg_str(0).into_owned();
+        let (_, cmd) = COMMANDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("known ban command");
+        cmd(bans, cbuf, &args);
     }
 
     #[test]
@@ -384,40 +384,45 @@ mod tests {
 
     #[test]
     fn bans_match_networks_and_expire() {
-        let mut proxy = Proxy::new_for_tests();
-        proxy.execute_line(b"addip 192.246.40");
-        proxy.execute_line(b"addip 10.1.1.1 safe");
-        proxy.execute_line(b"addip 10.2.2.2 ban +0.5");
-        assert!(proxy.bans.is_banned(addr([192, 246, 40, 7])));
-        assert!(!proxy.bans.is_banned(addr([192, 246, 41, 7])));
-        assert!(!proxy.bans.is_banned(addr([10, 1, 1, 1])));
-        assert!(proxy.bans.is_banned(addr([10, 2, 2, 2])));
-        assert_eq!(proxy.bans.filters.len(), 3);
+        let (mut bans, mut cbuf) = (Bans::default(), Cbuf::default());
+        run(&mut bans, &mut cbuf, b"addip 192.246.40");
+        run(&mut bans, &mut cbuf, b"addip 10.1.1.1 safe");
+        run(&mut bans, &mut cbuf, b"addip 10.2.2.2 ban +0.5");
+        run(&mut bans, &mut cbuf, b"addip 10.4.4.4 ban 0");
+        run(&mut bans, &mut cbuf, b"addip 10.5.5.5 ban +0");
+        assert!(bans.is_banned(addr([192, 246, 40, 7])));
+        assert!(!bans.is_banned(addr([192, 246, 41, 7])));
+        assert!(!bans.is_banned(addr([10, 1, 1, 1])));
+        assert!(bans.is_banned(addr([10, 2, 2, 2])));
+        assert_eq!(bans.filters.len(), 5);
+        assert_eq!(bans.filters[3].expires, None, "0 means permanent");
+        assert!(
+            bans.filters[4].expires.is_some_and(|t| t <= unix_now()),
+            "+0 expires at once"
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(600));
-        proxy.bans.clean_expired();
-        assert!(!proxy.bans.is_banned(addr([10, 2, 2, 2])));
-        assert_eq!(proxy.bans.filters.len(), 2);
+        bans.clean_expired();
+        assert!(!bans.is_banned(addr([10, 2, 2, 2])));
+        assert!(bans.is_banned(addr([10, 4, 4, 4])));
+        assert_eq!(bans.filters.len(), 3);
 
-        proxy.execute_line(b"removeip 192.246.40");
-        assert!(!proxy.bans.is_banned(addr([192, 246, 40, 7])));
+        run(&mut bans, &mut cbuf, b"removeip 192.246.40");
+        assert!(!bans.is_banned(addr([192, 246, 40, 7])));
     }
 
     #[test]
     fn banip_respects_safe_list_and_queues_addip() {
-        let mut proxy = Proxy::new_for_tests();
-        proxy.execute_line(b"addip 10.1.1.1 safe");
-        proxy.execute_line(b"banip 10.1.1.1 10m");
-        assert!(proxy.cmds.cbuf.next_line().is_none());
+        let (mut bans, mut cbuf) = (Bans::default(), Cbuf::default());
+        run(&mut bans, &mut cbuf, b"addip 10.1.1.1 safe");
+        run(&mut bans, &mut cbuf, b"banip 10.1.1.1 10m");
+        assert!(cbuf.next_line().is_none());
 
-        proxy.execute_line(b"banip 10.3.3.3 2h");
-        assert_eq!(
-            proxy.cmds.cbuf.next_line().unwrap(),
-            b"addip 10.3.3.3 ban +7200"
-        );
-        assert_eq!(proxy.cmds.cbuf.next_line().unwrap(), b"writeip");
+        run(&mut bans, &mut cbuf, b"banip 10.3.3.3 2h");
+        assert_eq!(cbuf.next_line().unwrap(), b"addip 10.3.3.3 ban +7200");
+        assert_eq!(cbuf.next_line().unwrap(), b"writeip");
 
-        proxy.execute_line(b"banip 10.3.3.3 2x");
-        assert!(proxy.cmds.cbuf.next_line().is_none());
+        run(&mut bans, &mut cbuf, b"banip 10.3.3.3 2x");
+        assert!(cbuf.next_line().is_none());
     }
 }

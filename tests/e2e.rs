@@ -35,10 +35,13 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// Every datagram the fake server received, with its arrival time.
+type Received = Arc<Mutex<Vec<(Instant, Vec<u8>)>>>;
+
 /// Minimal QW server: answers the handshake, echoes game packets, records everything.
 struct FakeServer {
     port: u16,
-    received: Arc<Mutex<Vec<Vec<u8>>>>,
+    received: Received,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -72,7 +75,10 @@ impl FakeServer {
                         continue;
                     };
                     let data = &buf[..len];
-                    received.lock().unwrap().push(data.to_vec());
+                    received
+                        .lock()
+                        .unwrap()
+                        .push((Instant::now(), data.to_vec()));
 
                     let reply: Vec<u8> = if data == [OOB, b"getchallenge\n"].concat() {
                         [OOB, b"c777\0"].concat()
@@ -111,8 +117,8 @@ impl FakeServer {
             .lock()
             .unwrap()
             .iter()
-            .filter(|d| matches(d))
-            .cloned()
+            .filter(|(_, d)| matches(d))
+            .map(|(_, d)| d.clone())
             .collect()
     }
 
@@ -246,13 +252,22 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Game packet: 10 bytes of netchan header followed by the payload.
+/// Game packet: 10 bytes of netchan header (a fresh sequence number, the
+/// acknowledged sequence and the qport) followed by the payload.
 fn game_packet(payload: &[u8]) -> Vec<u8> {
-    [&[5, 0, 0, 0, 6, 0, 0, 0, 5, 0][..], payload].concat()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQUENCE: AtomicU32 = AtomicU32::new(5);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    [
+        &sequence.to_le_bytes()[..],
+        &[6, 0, 0, 0, 5, 0][..],
+        payload,
+    ]
+    .concat()
 }
 
 /// Completes the QW handshake so game packets flow through to `server`.
-/// `userinfo_extra` is appended to the userinfo, e.g. `\\spectator\\1`.
+/// `userinfo_extra` is appended to the userinfo, e.g. `\spectator\1`.
 fn connect_client(proxy: &Proxy, server: &FakeServer, userinfo_extra: &[u8]) -> Client {
     let client = Client::connect(proxy.addr);
     let challenge = client.get_challenge();
@@ -413,6 +428,48 @@ fn connect_requests_are_validated() {
         reply.starts_with(&[OOB, b"challengeResponse "].concat()),
         "{reply:?}"
     );
+}
+
+#[test]
+fn tracking_spectator_drop_is_detected() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = connect_client(&proxy, &server, b"\\spectator\\1");
+
+    // ezQuake's autocam puts a clc_tmove ahead of the reliable drop.
+    let tmove = [5u8, 0x10, 0x27, 0xf0, 0xd8, 0x04, 0x73];
+    let drop = game_packet(&[&tmove[..], b"\x04drop\0"].concat());
+    client.send(&drop);
+    wait_until("drop to reach the server three times", || {
+        server.received(|d| d == drop).len() == 3
+    });
+    wait_until("peer to be dropped", || {
+        !contains(&client.oob(b"status"), b"666")
+    });
+}
+
+#[test]
+fn prx_host_names_are_looked_up_off_the_loop() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = Client::connect(proxy.addr);
+    let challenge = client.get_challenge();
+    // A name rather than an address goes through the resolver task.
+    let connect = [
+        OOB,
+        b"connect 28 5 ",
+        &challenge[..],
+        b" \"\\name\\p\\prx\\localhost:",
+        server.port.to_string().as_bytes(),
+        b"\"\n",
+    ]
+    .concat();
+    assert_eq!(client.ask(&connect), [OOB, b"j"].concat());
+    wait_until("proxy to log the connection", || {
+        proxy.log().contains(": connection")
+    });
+    let reply = client.ask(&game_packet(b"hello"));
+    assert!(reply.ends_with(b"echo:hello"), "{reply:?}");
 }
 
 #[test]

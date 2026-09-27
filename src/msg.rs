@@ -1,6 +1,6 @@
 //! Little-endian message reading and bounded message writing.
 
-use crate::cprint;
+use crate::dprint;
 
 pub const MSG_BUF_SIZE: usize = 8192;
 pub const MAX_MSGLEN: usize = 1450;
@@ -98,14 +98,14 @@ impl MsgWriter {
 
     pub fn write(&mut self, bytes: &[u8]) {
         if self.data.len() + bytes.len() > self.max {
-            cprint!(
-                "MsgWriter: overflow: cur = {}, len = {}, max = {}\n",
+            dprint!(
+                "message overflow: {} + {} bytes exceeds {}\n",
                 self.data.len(),
                 bytes.len(),
                 self.max
             );
-            self.data.clear();
             self.overflowed = true;
+            return;
         }
         self.data.extend_from_slice(bytes);
     }

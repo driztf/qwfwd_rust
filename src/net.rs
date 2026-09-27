@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use tokio::net::UdpSocket;
 
-use crate::cprint;
+use crate::dprint;
 use crate::msg::{MAX_MSGLEN, MsgWriter, PACKET_HEADER};
 
 pub fn v4(addr: SocketAddr) -> Option<SocketAddrV4> {
@@ -22,7 +22,7 @@ pub async fn resolve(host: &str, port: u16) -> Option<SocketAddrV4> {
         Err(_) => None,
     };
     if found.is_none() {
-        cprint!("resolve: wrong host: {host}\n");
+        dprint!("resolve: wrong host: {host}\n");
     }
     found
 }
@@ -43,8 +43,10 @@ pub fn is_oversize(err: &std::io::Error) -> bool {
 }
 
 /// Opens an unbound IPv4 socket for talking to one remote server.
-pub async fn open_ephemeral_socket() -> std::io::Result<UdpSocket> {
-    UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await
+pub fn open_ephemeral_socket() -> std::io::Result<UdpSocket> {
+    let socket = std::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket)
 }
 
 pub fn send(socket: &UdpSocket, data: &[u8], to: SocketAddrV4) {
@@ -54,7 +56,7 @@ pub fn send(socket: &UdpSocket, data: &[u8], to: SocketAddrV4) {
             ErrorKind::WouldBlock | ErrorKind::ConnectionRefused
         )
     {
-        cprint!("NET_SendPacket: sendto: {err}\n");
+        dprint!("sendto {to}: {err}\n");
     }
 }
 
@@ -63,7 +65,7 @@ pub fn send_oob(socket: &UdpSocket, to: SocketAddrV4, data: &[u8]) {
     let mut msg = MsgWriter::out_of_band(MAX_MSGLEN + PACKET_HEADER);
     msg.write(data);
     if msg.overflowed() {
-        cprint!("Netchan_OutOfBand: overflowed\n");
+        dprint!("out-of-band message to {to} too long, dropped\n");
         return;
     }
     send(socket, msg.as_bytes(), to);

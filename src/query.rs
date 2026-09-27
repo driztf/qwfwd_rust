@@ -4,13 +4,14 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use crate::cmd::{self, Args};
 use crate::console::developer;
 use crate::cvar::Cvars;
 use crate::msg::{MSG_BUF_SIZE, MsgWriter};
 use crate::protocol::{A2C_PRINT, S2M_HEARTBEAT};
-use crate::proxy::Proxy;
+use crate::proxy::Event;
 use crate::{cprint, dprint, net};
 
 /// How often at most one server gets pinged.
@@ -40,7 +41,8 @@ const MAX_MASTERS: usize = 8;
 const MAX_SERVERS: usize = 512;
 const MAX_FILTERS: usize = 16;
 
-const UNREACHABLE_PING: i32 = 0xFFFF;
+/// What `pingstatus` reports for a server that has never answered.
+const UNREACHABLE_PING_WIRE: i16 = -1;
 
 struct Master {
     addr: SocketAddrV4,
@@ -53,7 +55,53 @@ struct Server {
     reply: bool,
     ping_sent_at: Option<Instant>,
     ping_reply_at: Option<Instant>,
-    ping: i32,
+    /// Round trip in ms of the last answered ping.
+    ping: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveKind {
+    Masters,
+    Filters,
+}
+
+/// Host names from a cvar list, looked up off the main loop. `generation`
+/// identifies which edit of the cvar the lookup was started for, so a stale
+/// result from an earlier edit is ignored.
+pub struct Resolution {
+    kind: ResolveKind,
+    generation: u64,
+    results: Vec<(String, Option<SocketAddrV4>)>,
+}
+
+/// Looks up `host:port` targets in the background and delivers the result as an event.
+fn spawn_resolve(
+    kind: ResolveKind,
+    generation: u64,
+    targets: Vec<(String, String, u16)>,
+    events: mpsc::Sender<Event>,
+) {
+    tokio::spawn(async move {
+        // All at once, so a dead resolver costs one timeout rather than one per host.
+        let lookups: Vec<_> = targets
+            .into_iter()
+            .map(|(spec, host, port)| {
+                tokio::spawn(async move { (spec, net::resolve(&host, port).await) })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(lookups.len());
+        for lookup in lookups {
+            if let Ok(result) = lookup.await {
+                results.push(result);
+            }
+        }
+        let resolution = Resolution {
+            kind,
+            generation,
+            results,
+        };
+        let _ = events.send(Event::Resolved(resolution)).await;
+    });
 }
 
 pub struct Query {
@@ -61,10 +109,12 @@ pub struct Query {
     epoch: Instant,
     masters: Vec<Master>,
     masters_init_at: Instant,
+    masters_generation: u64,
     next_heartbeat: Instant,
     heartbeat_sequence: i32,
     servers: Vec<Server>,
     filters: Vec<Ipv4Addr>,
+    filters_generation: u64,
     ping_index: usize,
     last_ping_at: Option<Instant>,
 }
@@ -76,10 +126,12 @@ impl Query {
             epoch: now,
             masters: Vec::new(),
             masters_init_at: now,
+            masters_generation: 0,
             next_heartbeat: now,
             heartbeat_sequence: 0,
             servers: Vec::new(),
             filters: Vec::new(),
+            filters_generation: 0,
             ping_index: 0,
             last_ping_at: None,
         }
@@ -92,12 +144,36 @@ impl Query {
         cvars.get("masters_filter_servers", DEFAULT_SERVER_FILTER, 0);
     }
 
-    pub async fn frame(&mut self, cvars: &mut Cvars, socket: &UdpSocket, peer_count: usize) {
-        self.check_filters_modified(cvars).await;
-        self.check_masters_modified(cvars).await;
+    pub fn frame(
+        &mut self,
+        cvars: &mut Cvars,
+        socket: &UdpSocket,
+        peer_count: usize,
+        events: &mpsc::Sender<Event>,
+    ) {
+        self.check_filters_modified(cvars, events);
+        self.check_masters_modified(cvars, events);
         self.query_masters(cvars, socket);
         self.heartbeat_masters(cvars, socket, peer_count);
         self.ping_servers(cvars, socket);
+    }
+
+    /// Applies a finished background lookup, unless the cvar changed again meanwhile.
+    pub fn apply_resolution(&mut self, resolution: Resolution) {
+        match resolution.kind {
+            ResolveKind::Masters if resolution.generation == self.masters_generation => {
+                for (spec, addr) in resolution.results {
+                    self.add_master(&spec, addr);
+                }
+            }
+            ResolveKind::Filters if resolution.generation == self.filters_generation => {
+                for (spec, addr) in resolution.results {
+                    self.add_filter(&spec, addr);
+                }
+                self.remove_filtered_servers();
+            }
+            _ => dprint!("ignoring a stale {:?} lookup\n", resolution.kind),
+        }
     }
 
     /// Whether a packet from the proxy socket is a master server list reply.
@@ -120,31 +196,36 @@ impl Query {
         self.masters.iter_mut().find(|m| m.addr == addr)
     }
 
-    async fn add_master(&mut self, spec: &str) -> bool {
+    /// Splits a `host[:port]` master spec into a lookup target.
+    fn master_target(spec: String) -> Option<(String, String, u16)> {
         let (host, port) = match spec.split_once(':') {
             Some((host, port)) => (host, crate::parse::atoi(port.as_bytes())),
-            None => (spec, 0),
+            None => (spec.as_str(), 0),
         };
         let port = u16::try_from(port)
             .ok()
             .filter(|&p| p > 0 && p < 65535)
             .unwrap_or(DEFAULT_MASTER_PORT);
-
         if host.is_empty() {
             cprint!("failed to add master server: {spec}\n");
-            return false;
+            return None;
         }
-        let Some(addr) = net::resolve(host, port).await else {
+        let host = host.to_owned();
+        Some((spec, host, port))
+    }
+
+    fn add_master(&mut self, spec: &str, addr: Option<SocketAddrV4>) {
+        let Some(addr) = addr else {
             cprint!("failed to add master server: {spec}\n");
-            return false;
+            return;
         };
         if self.master_by_addr(addr).is_some() {
             cprint!("failed to add master server: {spec} - already added!\n");
-            return false;
+            return;
         }
         if self.masters.len() >= MAX_MASTERS {
             cprint!("failed to add master server: {spec}\n");
-            return false;
+            return;
         }
 
         self.masters.push(Master {
@@ -152,10 +233,9 @@ impl Query {
             next_query: Instant::now(),
         });
         cprint!("master server added: {spec}\n");
-        true
     }
 
-    async fn check_masters_modified(&mut self, cvars: &mut Cvars) {
+    fn check_masters_modified(&mut self, cvars: &mut Cvars, events: &mpsc::Sender<Event>) {
         if self.masters_init_at.elapsed() > MASTERS_REINIT_INTERVAL {
             dprint!("forcing masters re-init\n");
             cvars.mark_modified("masters");
@@ -167,8 +247,18 @@ impl Query {
         }
 
         self.reset_masters();
-        for spec in cmd::tokens(cvars.string("masters")) {
-            self.add_master(&spec).await;
+        self.masters_generation += 1;
+        let targets: Vec<_> = cmd::tokens(cvars.string("masters"))
+            .into_iter()
+            .filter_map(Self::master_target)
+            .collect();
+        if !targets.is_empty() {
+            spawn_resolve(
+                ResolveKind::Masters,
+                self.masters_generation,
+                targets,
+                events.clone(),
+            );
         }
     }
 
@@ -250,7 +340,7 @@ impl Query {
             reply: false,
             ping_sent_at: None,
             ping_reply_at: None,
-            ping: UNREACHABLE_PING,
+            ping: None,
         });
     }
 
@@ -305,7 +395,7 @@ impl Query {
         if let Some(server) = self.servers.iter_mut().find(|s| s.addr == from) {
             let now = Instant::now();
             let sent = server.ping_sent_at.unwrap_or(epoch);
-            server.ping = now.saturating_duration_since(sent).as_millis() as i32;
+            server.ping = Some(now.saturating_duration_since(sent).as_millis() as u32);
             server.ping_reply_at = Some(now);
             server.reply = true;
         }
@@ -321,48 +411,46 @@ impl Query {
             for server in &self.servers {
                 msg.write(&server.addr.ip().octets());
                 msg.write_short(server.addr.port() as i16);
-                msg.write_short(server.ping as i16);
+                msg.write_short(server.ping.map_or(UNREACHABLE_PING_WIRE, |ms| ms as i16));
             }
         }
 
         if msg.overflowed() {
-            cprint!("SVC_QRY_PingStatus: overflow\n");
+            dprint!("pingstatus reply too long, dropped\n");
             return;
         }
         net::send(socket, msg.as_bytes(), from);
     }
 
-    async fn add_filter(&mut self, spec: &str) -> bool {
-        if self.filters.len() >= MAX_FILTERS {
-            cprint!("failed to add server filter: {spec} - filter list are full!\n");
-            return false;
-        }
-        let host = spec.split_once(':').map_or(spec, |(host, _)| host);
+    /// Turns a filter spec (a host, with any port ignored) into a lookup target.
+    fn filter_target(spec: String) -> Option<(String, String, u16)> {
+        let host = spec.split_once(':').map_or(spec.as_str(), |(host, _)| host);
         if host.is_empty() {
             cprint!("failed to add server filter: {spec}\n");
-            return false;
+            return None;
         }
-        let Some(addr) = net::resolve(host, 0).await else {
+        let host = host.to_owned();
+        Some((spec, host, 0))
+    }
+
+    fn add_filter(&mut self, spec: &str, addr: Option<SocketAddrV4>) {
+        if self.filters.len() >= MAX_FILTERS {
+            cprint!("failed to add server filter: {spec} - filter list are full!\n");
+            return;
+        }
+        let Some(addr) = addr else {
             cprint!("failed to add server filter: {spec}\n");
-            return false;
+            return;
         };
         if self.filters.contains(addr.ip()) {
             cprint!("failed to add server filter: {spec} - already added!\n");
-            return false;
+            return;
         }
         self.filters.push(*addr.ip());
         cprint!("server filter added: {spec}\n");
-        true
     }
 
-    async fn check_filters_modified(&mut self, cvars: &mut Cvars) {
-        if !cvars.take_modified("masters_filter_servers") {
-            return;
-        }
-        self.filters.clear();
-        for spec in cmd::tokens(cvars.string("masters_filter_servers")) {
-            self.add_filter(&spec).await;
-        }
+    fn remove_filtered_servers(&mut self) {
         let filters = &self.filters;
         self.servers.retain(|s| {
             let filtered = filters.contains(s.addr.ip());
@@ -372,28 +460,48 @@ impl Query {
             !filtered
         });
     }
-}
 
-impl Proxy {
-    pub fn register_query_commands(&mut self) {
-        self.cmds.register("svlist", cmd_svlist);
-        self.cmds.register("heartbeat", cmd_heartbeat);
+    fn check_filters_modified(&mut self, cvars: &mut Cvars, events: &mpsc::Sender<Event>) {
+        if !cvars.take_modified("masters_filter_servers") {
+            return;
+        }
+        self.filters.clear();
+        self.filters_generation += 1;
+        let targets: Vec<_> = cmd::tokens(cvars.string("masters_filter_servers"))
+            .into_iter()
+            .filter_map(Self::filter_target)
+            .collect();
+        if targets.is_empty() {
+            self.remove_filtered_servers();
+        } else {
+            spawn_resolve(
+                ResolveKind::Filters,
+                self.filters_generation,
+                targets,
+                events.clone(),
+            );
+        }
     }
 }
 
-fn cmd_svlist(proxy: &mut Proxy, _args: &Args) {
+pub type Cmd = fn(&mut Query, &Args);
+
+pub const COMMANDS: &[(&str, Cmd)] = &[("svlist", cmd_svlist), ("heartbeat", cmd_heartbeat)];
+
+fn cmd_svlist(query: &mut Query, _args: &Args) {
     cprint!("=== server list ===\n");
     cprint!("### {:<21} ping\n", "address");
     cprint!("--------------------------------------\n");
-    for (i, server) in proxy.query.servers.iter().enumerate() {
-        cprint!("{:3} {:<21} {}\n", i + 1, server.addr, server.ping);
+    for (i, server) in query.servers.iter().enumerate() {
+        let ping = server.ping.map_or("-".to_owned(), |ms| ms.to_string());
+        cprint!("{:3} {:<21} {ping}\n", i + 1, server.addr);
     }
     cprint!("--------------------------------------\n");
-    cprint!("{} servers\n", proxy.query.servers.len());
+    cprint!("{} servers\n", query.servers.len());
 }
 
-fn cmd_heartbeat(proxy: &mut Proxy, _args: &Args) {
-    proxy.query.trigger_heartbeat();
+fn cmd_heartbeat(query: &mut Query, _args: &Args) {
+    query.trigger_heartbeat();
 }
 
 #[cfg(test)]

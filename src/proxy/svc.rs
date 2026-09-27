@@ -1,28 +1,48 @@
 //! Server-side handling of connectionless packets from clients: challenges,
 //! connection requests, status queries.
 
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
 
+use super::{Event, Proxy};
 use crate::cmd::Args;
 use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
-use crate::peer::{PeerState, Protocol};
+use crate::peer::{PeerState, Protocol, Registration};
 use crate::protocol::{
-    A2A_ACK, A2A_PING, A2C_PRINT, Q3_DEFAULT_SERVER_PORT, QW_DEFAULT_SERVER_PORT,
-    QW_PROTOCOL_VERSION, QW_VERSION, QWFWD_PRX_KEY, QWFWD_VERSION_SHORT, S2C_CHALLENGE,
-    S2C_CONNECTION,
+    A2A_ACK, A2A_PING, A2C_PRINT, Q3_CONNECT_PAYLOAD, Q3_DEFAULT_SERVER_PORT,
+    QW_DEFAULT_SERVER_PORT, QW_PROTOCOL_VERSION, QW_VERSION, QWFWD_PRX_KEY, QWFWD_VERSION_SHORT,
+    S2C_CHALLENGE, S2C_CONNECTION,
 };
-use crate::proxy::Proxy;
 use crate::query::Query;
 use crate::{dprint, huff, info, net, parse};
 
 /// Large enough that an attacker cannot cycle out legitimate challenges.
 const MAX_CHALLENGES: usize = 1024;
+/// Host lookups in flight for connect requests, over all clients; beyond
+/// this a connect naming a host is refused until one finishes.
+const MAX_LOOKUPS: usize = 64;
 
-/// Offset of the compressed payload in a Q3 `connect` packet: the -1 header plus `connect `.
-const Q3_CONNECT_PAYLOAD: usize = 12;
+/// A validated connect request waiting for its remote host to be looked up.
+pub struct PendingConnect {
+    pub from: SocketAddrV4,
+    pub host: String,
+    pub port: u16,
+    pub userinfo: Vec<u8>,
+    pub qport: i32,
+    pub proto: Protocol,
+    /// The challenge the client connected with, for the Q3 reconnect dance.
+    pub challenge: i32,
+    /// Which of the client's requests this is; an older one's result is ignored.
+    pub generation: u64,
+}
+
+/// A client's host lookup in flight, and the request that superseded it, if any.
+pub struct LookupSlot {
+    generation: u64,
+    queued: Option<PendingConnect>,
+}
 
 pub struct Challenge {
     pub addr: SocketAddrV4,
@@ -73,16 +93,43 @@ impl Challenges {
 }
 
 impl Proxy {
+    /// Handles a datagram from a client on the proxy socket.
+    pub fn handle_client_packet(
+        &mut self,
+        socket: &UdpSocket,
+        from: SocketAddrV4,
+        msg: &mut Vec<u8>,
+    ) {
+        if self.bans.is_banned(from) {
+            return;
+        }
+        if msg.as_slice() == [A2A_ACK] {
+            self.query.ping_reply(&self.shell.cvars, from);
+            return;
+        }
+
+        let connectionless = match MsgReader::new(msg).read_long() {
+            None => return,
+            Some(-1) => true,
+            Some(_) => false,
+        };
+        if connectionless && !self.sv_connectionless(socket, from, msg) {
+            return;
+        }
+
+        self.peers.forward_from_client(from, msg, connectionless);
+    }
+
     /// Handles an out-of-band packet from a client. Returns whether the packet
     /// should also be forwarded to the client's remote server.
-    pub async fn sv_connectionless(
+    fn sv_connectionless(
         &mut self,
         socket: &UdpSocket,
         from: SocketAddrV4,
         msg: &mut Vec<u8>,
     ) -> bool {
         if Query::is_master_reply(msg) {
-            self.query.parse_master_reply(&self.cvars, from, msg);
+            self.query.parse_master_reply(&self.shell.cvars, from, msg);
             return false;
         }
 
@@ -108,8 +155,8 @@ impl Proxy {
         let args = Args::tokenize(&text);
         match args.arg(0) {
             b"ping" | [A2A_PING] => self.svc_ping(socket, from),
-            b"pingstatus" => self.query.ping_status(&self.cvars, socket, from),
-            b"connect" => self.svc_direct_connect(socket, from, &args).await,
+            b"pingstatus" => self.query.ping_status(&self.shell.cvars, socket, from),
+            b"connect" => self.svc_direct_connect(socket, from, &args),
             b"getchallenge" => {
                 let proto = if text == b"getchallenge\n" {
                     Protocol::Qw
@@ -135,15 +182,16 @@ impl Proxy {
         // client must be handed the challenge the remote server issued.
         let server_challenge = match proto {
             Protocol::Q3 => self
-                .peer_by_addr(from)
-                .filter(|p| p.state == PeerState::Connected)
-                .map(|p| p.challenge),
+                .peers
+                .get(from)
+                .filter(|p| p.state() == PeerState::Connected)
+                .map(|p| p.challenge()),
             Protocol::Qw => None,
         };
 
         let entry = self.challenges.get_or_issue(from, proto);
         if let Some(challenge) = server_challenge {
-            dprint!("challenge q3 overwrite trick!\n");
+            dprint!("handing {from} the server's challenge for its q3 reconnect\n");
             entry.challenge = challenge;
         }
         let challenge = entry.challenge;
@@ -213,7 +261,9 @@ impl Proxy {
         Some(userinfo.to_vec())
     }
 
-    async fn svc_direct_connect(&mut self, socket: &UdpSocket, from: SocketAddrV4, args: &Args) {
+    /// Validates a connect request and starts looking up its remote host;
+    /// [`finish_connect`](Self::finish_connect) completes it.
+    fn svc_direct_connect(&mut self, socket: &UdpSocket, from: SocketAddrV4, args: &Args) {
         let Some(entry) = self.challenges.find(from) else {
             print_to(socket, from, "\nNo challenge for address.\n");
             return;
@@ -254,7 +304,10 @@ impl Proxy {
             print_to(
                 socket,
                 from,
-                &format!("\nproxy@{} is full\n\n", self.cvars.string("hostname")),
+                &format!(
+                    "\nproxy@{} is full\n\n",
+                    self.shell.cvars.string("hostname")
+                ),
             );
             return;
         }
@@ -316,11 +369,116 @@ impl Proxy {
             true,
         );
 
-        let host = String::from_utf8_lossy(host).into_owned();
-        let Some(index) = self
-            .peer_new(&host, port, from, &userinfo, qport, proto)
-            .await
-        else {
+        let pending = PendingConnect {
+            from,
+            host: String::from_utf8_lossy(host).into_owned(),
+            port,
+            userinfo,
+            qport,
+            proto,
+            challenge,
+            generation: 0,
+        };
+        // Most prx keys name an address, which needs no lookup.
+        if let Ok(ip) = pending.host.parse::<Ipv4Addr>() {
+            self.finish_connect(socket, pending, Some(SocketAddrV4::new(ip, port)));
+            return;
+        }
+        self.queue_lookup(pending);
+    }
+
+    /// Starts the host lookup for a connect request. One lookup runs per
+    /// client at a time: a request arriving while one is in flight waits for
+    /// it and supersedes it, so the newest request is the one applied and a
+    /// client cannot pile up lookups.
+    fn queue_lookup(&mut self, mut pending: PendingConnect) {
+        let from = pending.from;
+        if let Some(slot) = self.lookups.get_mut(&from) {
+            slot.generation += 1;
+            slot.queued = Some(pending);
+            return;
+        }
+        if self.lookups.len() >= MAX_LOOKUPS {
+            dprint!("lookup for {from} refused: {MAX_LOOKUPS} already in flight\n");
+            return;
+        }
+        pending.generation = 1;
+        let slot = LookupSlot {
+            generation: 1,
+            queued: None,
+        };
+        self.lookups.insert(from, slot);
+        self.spawn_lookup(pending);
+    }
+
+    fn spawn_lookup(&self, pending: PendingConnect) {
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let to = net::resolve(&pending.host, pending.port).await;
+            let _ = events.send(Event::ConnectResolved(pending, to)).await;
+        });
+    }
+
+    /// A host lookup finished: completes the connect when it is still the
+    /// client's newest request, otherwise starts the one that superseded it.
+    pub(super) fn lookup_finished(
+        &mut self,
+        socket: &UdpSocket,
+        pending: PendingConnect,
+        to: Option<SocketAddrV4>,
+    ) {
+        let from = pending.from;
+        let superseded_by = match self.lookups.get_mut(&from) {
+            None => return,
+            Some(slot) if pending.generation == slot.generation => None,
+            Some(slot) => {
+                let next = slot.queued.take().map(|mut next| {
+                    next.generation = slot.generation;
+                    next
+                });
+                Some(next)
+            }
+        };
+        match superseded_by {
+            Some(Some(next)) => self.spawn_lookup(next),
+            Some(None) => {}
+            None => {
+                self.lookups.remove(&from);
+                self.finish_connect(socket, pending, to);
+            }
+        }
+    }
+
+    /// Completes a connect request once its remote host is known.
+    pub(super) fn finish_connect(
+        &mut self,
+        socket: &UdpSocket,
+        pending: PendingConnect,
+        to: Option<SocketAddrV4>,
+    ) {
+        let PendingConnect {
+            from,
+            userinfo,
+            qport,
+            proto,
+            challenge,
+            ..
+        } = pending;
+        let max_clients = self.max_clients();
+        let index = match to {
+            Some(to) if self.whitelist.allows(*to.ip()) && !self.bans.is_banned(to) => {
+                let registration = Registration {
+                    to,
+                    from,
+                    userinfo: &userinfo,
+                    qport,
+                    proto,
+                };
+                self.peers.register(registration, max_clients, &self.events)
+            }
+            _ => None,
+        };
+        let Some(index) = index else {
             dprint!("peer {from} was not added\n");
             return;
         };
@@ -331,9 +489,11 @@ impl Proxy {
                 net::send_oob_print(socket, from, &(S2C_CONNECTION as char).to_string())
             }
             Protocol::Q3 => {
-                let peer = &self.peers[index];
-                if peer.state == PeerState::Connected {
-                    if peer.challenge == challenge {
+                let Some(peer) = self.peers.get_index(index) else {
+                    return;
+                };
+                if peer.state() == PeerState::Connected {
+                    if peer.challenge() == challenge {
                         net::send_oob_print(socket, from, "connectResponse");
                     } else {
                         // The client must come back with the server's challenge.
@@ -362,24 +522,23 @@ impl Proxy {
         };
 
         if opt == OLDSTYLE || opt & SERVERINFO != 0 {
-            let mut line = self.cvars.serverinfo.clone();
+            let mut line = self.shell.serverinfo.render(&self.shell.cvars);
             line.push(b'\n');
             msg.print(&line);
         }
 
         if opt == OLDSTYLE || opt & (PLAYERS | SPECTATORS) != 0 {
-            for peer in &self.peers {
+            for peer in self.peers.iter() {
                 let (frags, ping, skin) = (0, 666, "");
+                let (top, bottom) = peer.colors();
                 let mut line = format!(
                     "{} {frags} {} {ping} \"",
-                    peer.userid,
+                    peer.userid(),
                     peer.minutes_connected()
                 )
                 .into_bytes();
-                line.extend_from_slice(&peer.name);
-                line.extend_from_slice(
-                    format!("\" \"{skin}\" {} {}\n", peer.top_color, peer.bottom_color).as_bytes(),
-                );
+                line.extend_from_slice(peer.name());
+                line.extend_from_slice(format!("\" \"{skin}\" {top} {bottom}\n").as_bytes());
                 msg.print(&line);
             }
         }
