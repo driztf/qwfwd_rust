@@ -1,56 +1,47 @@
 name: build targets
 on: [pull_request]
 jobs:
+  test:
+    if: github.repository == 'QW-Group/qwfwd'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
   build:
     if: github.repository == 'driztf/qwfwd_rust'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-       target: [linux-amd64, linux-i686, linux-armhf, linux-aarch64, windows-x64, windows-x86]
-       include:
-         - target: linux-amd64
-           os: linux
-           arch: amd64
-           build-image: debian:stable
-           ext: ""
-         - target: linux-i686
-           os: linux
-           arch: i686
-           build-image: debian:stable
-           ext: ""
-         - target: linux-armhf
-           os: linux
-           arch: armhf
-           build-image: debian:stable
-           ext: ""
-         - target: linux-aarch64
-           os: linux
-           arch: aarch64
-           build-image: debian:stable
-           ext: ""
-         - target: windows-x64
-           os: windows
-           arch: x64
-           build-image: debian:stable
-           ext: ".exe"
-         - target: windows-x86
-           os: windows
-           arch: x86
-           build-image: debian:stable
-           ext: ".exe"
-    container: ${{ matrix.build-image }}
+        include:
+          - target: linux-amd64
+            triple: x86_64-unknown-linux-gnu
+          - target: linux-i686
+            triple: i686-unknown-linux-gnu
+          - target: linux-armhf
+            triple: armv7-unknown-linux-gnueabihf
+          - target: linux-aarch64
+            triple: aarch64-unknown-linux-gnu
+          - target: windows-x64
+            triple: x86_64-pc-windows-gnu
+          - target: windows-x86
+            triple: i686-pc-windows-gnu
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Prepare Build Environemnt
-        shell: bash
-        run: |
-             apt-get update
-             apt-get -y install build-essential cmake gcc-i686-linux-gnu
-             apt-get -y install gcc-arm-linux-gnueabihf libc6-dev-armhf-cross gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-             apt-get -y install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross --locked
       - name: Build
-        shell: bash
-        run: |
-             ./build_cmake.sh ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.triple }}

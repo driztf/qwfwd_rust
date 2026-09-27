@@ -16,48 +16,38 @@ You can find the prebuilt binaries on [this download page][qwfwd-builds].
 
 ## Prerequisites
 
-None at the moment.
+A stable [Rust toolchain](https://rustup.rs/) (edition 2024, Rust 1.85 or newer).
 
 ## Building binaries
 
-### Build from source with CMake
-
-Assuming you have installed essential build tools and ``CMake``
 ```bash
-mkdir build && cmake -B build . && cmake --build build
-```
-Build artifacts would be inside ``build/`` directory, for unix like systems it would be ``qwfwd``.
-
-You can also use ``build_cmake.sh`` script, it mostly suitable for cross compilation
-and probably useless for experienced CMake user.
-Some examples:
-```
-./build_cmake.sh linux-amd64
-```
-should build QWFWD for ``linux-amd64`` platform, release version, check [cross-cmake](tools/cross-cmake) directory for all platforms
-
-```
-B=Debug ./build_cmake.sh linux-amd64
-```
-should build QWFWD for linux-amd64 platform with debug
-
-```
-V=1 B=Debug ./build_cmake.sh linux-amd64
-```
-should build QWFWD for linux-amd64 platform with debug, verbose (useful if you need validate compiler flags)
-
-```
-G="Unix Makefiles" ./build_cmake.sh linux-amd64
+cargo build --release
 ```
 
-force CMake generator to be unix makefiles
+The binary is written to ``target/release/qwfwd`` (``qwfwd.exe`` on Windows).
 
-```
-./build_cmake.sh linux-amd64
+To cross compile, install [cross](https://github.com/cross-rs/cross) and pick a target triple, for example:
+```bash
+cross build --release --target aarch64-unknown-linux-gnu
 ```
 
-build QWFWD for ``linux-amd64`` version, you can provide
-any platform combinations.
+## Running
+
+```bash
+qwfwd [port [ip]] [+command ...]
+```
+
+The proxy reads ``qwfwd/qwfwd.cfg`` (see [the example config](resources/example-configs/qwfwd.cfg))
+and ``qwfwd_listip.cfg`` on startup; ``+set hostname "my proxy"`` style arguments run after the
+config. When attached to a terminal the console accepts commands on stdin, and ``SIGHUP``
+reloads ``qwfwd.cfg``. Run ``cmdlist`` and ``cvarlist`` in the console for the full list.
+
+## Development
+
+```bash
+cargo test
+cargo clippy --all-targets
+```
 
 ## Versioning
 
