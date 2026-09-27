@@ -296,7 +296,11 @@ impl<X: Copy> Shell<X> {
             }
         };
         // Console commands are the only way cvars change at runtime.
-        console::set_developer(self.cvars.int("developer"));
+        // Only when it changed: the level is process-wide, and a shell that
+        // has no say in it (a test's, say) must not reset it.
+        if self.cvars.take_modified("developer") {
+            console::set_developer(self.cvars.int("developer"));
+        }
         external
     }
 
