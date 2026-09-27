@@ -11,7 +11,7 @@
 //! run at the client's rate and the queue holds only what the clumping needs.
 //! Whatever slack builds up beyond that, because the estimate is a touch long
 //! or a stall let the queue grow, is found as the smallest wait over the last
-//! second and shaved off the following slots a little at a time. Once a
+//! quarter second and shaved off the following slots a little at a time. Once a
 //! backlog grows past a threshold the queue drains at double rate to recover
 //! from a latency burst, and packets that have waited past a hard limit are
 //! discarded, oldest first, so the remote end skips ahead rather than falling
@@ -96,8 +96,14 @@ const MIN_RATE_SPAN_MS: f64 = 1000.0;
 /// only builds slack, which is drained, while a short one runs the queue dry
 /// and re-syncs the schedule to a clumped arrival.
 const RATE_MARGIN: f64 = 1.002;
+/// A client measured this close to the configured rate is taken to be
+/// exactly at it. The measurement wobbles by a few tenths of a percent as
+/// clumps enter and leave the window, and a stock QuakeWorld client sends
+/// at precisely the configured rate, so using it as is spares that client
+/// the margin and the slack it builds.
+const RATE_SNAP: f64 = 0.005;
 /// How often the slack in the queue is measured and scheduled for draining.
-const SLACK_PERIOD: Duration = Duration::from_millis(500);
+const SLACK_PERIOD: Duration = Duration::from_millis(250);
 /// Slack is shaved off each slot by this share of what is left, so a lot of
 /// slack goes quickly and the last of it gently, between a floor (as a
 /// fraction of the interval) and the configured cap.
@@ -138,6 +144,10 @@ impl Pacer {
     pub fn interval(&self, now: Instant, config: &PacerConfig) -> Duration {
         let (count, mean_ms) = self.rate.mean(now);
         if count < MIN_RATE_SAMPLES || mean_ms * (count as f64) < MIN_RATE_SPAN_MS {
+            return config.interval;
+        }
+        let configured_ms = config.interval.as_secs_f64() * 1000.0;
+        if (mean_ms - configured_ms).abs() <= configured_ms * RATE_SNAP {
             return config.interval;
         }
         Duration::from_secs_f64((mean_ms * RATE_MARGIN / 1000.0).clamp(0.001, 1.0))
@@ -757,6 +767,29 @@ mod tests {
     }
 
     #[test]
+    fn a_client_near_the_configured_rate_is_taken_to_be_at_it() {
+        let cfg = PacerConfig::new(13.0, 50, 200, 10.0);
+        let mut pacer = Pacer::default();
+        let t0 = Instant::now();
+        // 12.96 ms gaps: 0.3% off the configured 13 ms, well within the wobble.
+        let mut t = t0;
+        for id in 0..=100u8 {
+            pacer.push(t, &[id], Some(&cfg));
+            t += Duration::from_micros(12_960);
+        }
+        assert_eq!(pacer.interval(t, &cfg), cfg.interval);
+        // 12 ms gaps are a different rate and get the measured interval.
+        let mut pacer = Pacer::default();
+        let mut t = t0;
+        for id in 0..=100u8 {
+            pacer.push(t, &[id], Some(&cfg));
+            t += 12 * MS;
+        }
+        let measured = pacer.interval(t, &cfg).as_secs_f64() * 1000.0;
+        assert!((measured - 12.0 * RATE_MARGIN).abs() < 1e-6, "{measured}");
+    }
+
+    #[test]
     fn interval_is_the_measured_rate_once_known() {
         let cfg = PacerConfig::new(13.0, 50, 200, 10.0);
         let mut pacer = Pacer::default();
@@ -843,7 +876,7 @@ mod tests {
             }
         }
         // 39 ms of slack goes at up to 10% of a slot per packet once the first
-        // half-second period is over.
+        // quarter-second period is over.
         let empty_at = empty_at.expect("queue never drained");
         assert!(
             empty_at <= Duration::from_millis(1500),
