@@ -27,6 +27,21 @@ pub async fn resolve(host: &str, port: u16) -> Option<SocketAddrV4> {
     found
 }
 
+/// Whether a receive failed because the datagram was larger than the
+/// buffer. Windows reports that as an error (WSAEMSGSIZE) where other
+/// systems truncate the datagram and return it.
+pub fn is_oversize(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(10040)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = err;
+        false
+    }
+}
+
 /// Opens an unbound IPv4 socket for talking to one remote server.
 pub async fn open_ephemeral_socket() -> std::io::Result<UdpSocket> {
     UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await

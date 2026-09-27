@@ -89,8 +89,18 @@ fn parse_color(userinfo: &[u8], key: &[u8]) -> i32 {
     parse::atoi(info::value_for_key(userinfo, key)).clamp(0, 16)
 }
 
+/// What a peer's reader task reports to the main loop.
+pub enum PeerEvent {
+    Packet(PeerPacket),
+    /// The peer's socket can no longer be read, so the peer is useless.
+    Lost {
+        userid: i32,
+        error: String,
+    },
+}
+
 /// Pumps datagrams from a peer's socket into the main loop.
-async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerPacket>) {
+async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerEvent>) {
     let mut buf = vec![0u8; MSG_BUF_SIZE];
     loop {
         match socket.recv_from(&mut buf).await {
@@ -105,15 +115,24 @@ async fn peer_reader(userid: i32, socket: Arc<UdpSocket>, tx: mpsc::Sender<PeerP
                     from,
                     data: buf[..len].to_vec(),
                 };
-                if tx.send(packet).await.is_err() {
+                if tx.send(PeerEvent::Packet(packet)).await.is_err() {
                     return;
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
                 dprint!("NET_GetPacket: Connection was forcibly closed\n");
             }
+            Err(err) if net::is_oversize(&err) => {
+                cprint!("NET_GetPacket: Oversize packet\n");
+            }
             Err(err) => {
-                cprint!("NET_GetPacket: recvfrom: {err}\n");
+                // Nobody would read this socket again; have the peer dropped
+                // rather than leave the client with a one-way connection.
+                let lost = PeerEvent::Lost {
+                    userid,
+                    error: err.to_string(),
+                };
+                let _ = tx.send(lost).await;
                 return;
             }
         }
@@ -246,6 +265,19 @@ impl Proxy {
     }
 
     /// Handles a datagram from a remote server on a peer's socket.
+    /// Handles what a peer's reader task reported.
+    pub fn handle_peer_event(&mut self, socket: &UdpSocket, event: PeerEvent) {
+        match event {
+            PeerEvent::Packet(packet) => self.handle_server_packet(socket, packet),
+            PeerEvent::Lost { userid, error } => {
+                if let Some(peer) = self.peers.iter_mut().find(|p| p.userid == userid) {
+                    cprint!("NET_GetPacket: recvfrom: {error}, dropping peer {userid}\n");
+                    peer.state = PeerState::Drop;
+                }
+            }
+        }
+    }
+
     pub fn handle_server_packet(&mut self, socket: &UdpSocket, packet: PeerPacket) {
         if self.bans.is_banned(packet.from) {
             return;
@@ -368,6 +400,27 @@ mod tests {
         assert!(!is_drop_command(&msg));
         assert!(!is_drop_command(&[0u8; 11]));
         assert!(!is_drop_command(b"short"));
+    }
+
+    #[tokio::test]
+    async fn lost_peer_reader_drops_the_peer() {
+        let mut proxy = Proxy::new_for_tests();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let from = "127.0.0.1:27001".parse().unwrap();
+        let index = proxy
+            .peer_new("127.0.0.1", 27500, from, b"\\name\\x", 5, Protocol::Qw)
+            .await
+            .unwrap();
+        let userid = proxy.peers[index].userid;
+
+        let lost = PeerEvent::Lost {
+            userid,
+            error: "socket gone".to_string(),
+        };
+        proxy.handle_peer_event(&socket, lost);
+        assert!(proxy.peers[index].state == PeerState::Drop);
+        proxy.drop_dead_peers();
+        assert!(proxy.peers.is_empty());
     }
 
     #[test]

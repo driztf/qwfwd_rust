@@ -12,7 +12,7 @@ use crate::cmd::{Args, Commands};
 use crate::cvar::{self, Cvars};
 use crate::info::MAX_INFO_STRING;
 use crate::msg::MSG_BUF_SIZE;
-use crate::peer::{Peer, PeerPacket};
+use crate::peer::{Peer, PeerEvent};
 use crate::protocol::{QWFWD_DEFAULT_PORT, QWFWD_URL, QWFWD_VERSION, QWFWD_VERSION_SHORT};
 use crate::query::Query;
 use crate::svc::Challenges;
@@ -38,13 +38,13 @@ pub struct Proxy {
     pub challenges: Challenges,
     pub peers: Vec<Peer>,
     pub next_userid: i32,
-    pub peer_tx: mpsc::Sender<PeerPacket>,
+    pub peer_tx: mpsc::Sender<PeerEvent>,
     want_exit: bool,
     reload_requested: bool,
 }
 
 impl Proxy {
-    pub fn new(peer_tx: mpsc::Sender<PeerPacket>) -> Self {
+    pub fn new(peer_tx: mpsc::Sender<PeerEvent>) -> Self {
         let mut proxy = Proxy {
             cvars: Cvars::default(),
             cmds: Commands::default(),
@@ -156,9 +156,12 @@ pub async fn run(params: Params) -> Result<(), String> {
                 Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
                     dprint!("NET_GetPacket: Connection was forcibly closed\n");
                 }
+                Err(err) if net::is_oversize(&err) => {
+                    cprint!("NET_GetPacket: Oversize packet\n");
+                }
                 Err(err) => return Err(format!("NET_GetPacket: recvfrom: {err}")),
             },
-            Some(packet) = peer_rx.recv() => proxy.handle_server_packet(&socket, packet),
+            Some(event) = peer_rx.recv() => proxy.handle_peer_event(&socket, event),
             Some(line) = stdin_rx.recv() => proxy.cmds.cbuf.insert_text(line.as_bytes()),
             _ = hangup.recv() => proxy.reload_requested = true,
             _ = ticker.tick() => {}
