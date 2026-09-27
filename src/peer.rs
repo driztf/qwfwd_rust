@@ -232,19 +232,25 @@ impl Peers {
             proto,
         } = registration;
         if let Some(index) = self.list.iter().position(|p| p.from == from) {
-            let peer = &mut self.list[index];
-            let now = Instant::now();
-            peer.to = to;
-            // A reconnecting Q3 client keeps its state; the server side is unaware of the reconnect.
-            if proto != Protocol::Q3 {
-                peer.state = PeerState::Challenge;
-                peer.connected_at = now;
+            if self.list[index].state == PeerState::Drop {
+                // Its reader is gone: a fresh peer replaces it rather than
+                // reviving a socket nobody reads.
+                self.list.remove(index);
+            } else {
+                let peer = &mut self.list[index];
+                let now = Instant::now();
+                peer.to = to;
+                // A reconnecting Q3 client keeps its state; the server side is unaware of the reconnect.
+                if proto != Protocol::Q3 {
+                    peer.state = PeerState::Challenge;
+                    peer.connected_at = now;
+                }
+                peer.qport = qport;
+                peer.proto = proto;
+                peer.apply_userinfo(userinfo);
+                peer.last_seen = now;
+                return Some(index);
             }
-            peer.qport = qport;
-            peer.proto = proto;
-            peer.apply_userinfo(userinfo);
-            peer.last_seen = now;
-            return Some(index);
         }
 
         if self.list.len() >= max_clients {
@@ -510,8 +516,22 @@ mod tests {
 
         peers.lose(userid, "socket gone");
         assert!(peers.get_index(index).unwrap().state() == PeerState::Drop);
+
+        // A reconnect before the tick removes it gets a fresh peer, not the dead one.
+        let registration = Registration {
+            to: "127.0.0.1:27500".parse().unwrap(),
+            from: "127.0.0.1:27001".parse().unwrap(),
+            userinfo: b"\\name\\x",
+            qport: 5,
+            proto: Protocol::Qw,
+        };
+        let index = peers.register(registration, 8, &events).unwrap();
+        assert_eq!(peers.len(), 1);
+        let peer = peers.get_index(index).unwrap();
+        assert!(peer.userid() != userid);
+        assert!(peer.state() == PeerState::Challenge);
         peers.drop_dead();
-        assert_eq!(peers.len(), 0);
+        assert_eq!(peers.len(), 1);
     }
 
     #[test]

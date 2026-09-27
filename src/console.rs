@@ -12,9 +12,6 @@ static DEVELOPER: AtomicI32 = AtomicI32::new(0);
 /// log lines do not garble the command being typed.
 struct Interactive {
     printer: Box<dyn ExternalPrinter + Send>,
-    /// Text since the last newline; the editor redraws its prompt after every
-    /// message, so only whole lines are handed over.
-    partial: String,
 }
 
 static INTERACTIVE: Mutex<Option<Interactive>> = Mutex::new(None);
@@ -30,10 +27,7 @@ pub fn set_developer(level: i32) {
 /// Routes subsequent output through an interactive line editor.
 pub fn set_printer(printer: Box<dyn ExternalPrinter + Send>) {
     if let Ok(mut guard) = INTERACTIVE.lock() {
-        *guard = Some(Interactive {
-            printer,
-            partial: String::new(),
-        });
+        *guard = Some(Interactive { printer });
     }
 }
 
@@ -41,13 +35,7 @@ pub fn print(text: &str) {
     if let Ok(mut guard) = INTERACTIVE.lock()
         && let Some(interactive) = guard.as_mut()
     {
-        interactive.partial.push_str(text);
-        let Some(newline) = interactive.partial.rfind('\n') else {
-            return;
-        };
-        let rest = interactive.partial.split_off(newline + 1);
-        let lines = std::mem::replace(&mut interactive.partial, rest);
-        if interactive.printer.print(lines).is_ok() {
+        if interactive.printer.print(text.to_string()).is_ok() {
             return;
         }
         // The editor is gone; fall back to plain stdout from now on.

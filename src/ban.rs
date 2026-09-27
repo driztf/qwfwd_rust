@@ -186,16 +186,14 @@ fn cmd_addip(bans: &mut Bans, _cbuf: &mut Cbuf, args: &Args) {
         }
     };
 
-    // "+10" bans for ten seconds from now; a bare number is an absolute unix
-    // time, and 0 (what writeip records for permanent bans) means no expiry.
+    // "+10" bans for ten seconds from now (so "+0" expires at once); a bare
+    // number is an absolute unix time, and a bare 0 (what writeip records
+    // for permanent bans) means no expiry.
     let when = args.arg(3);
-    let (base, when) = match when.strip_prefix(b"+") {
-        Some(relative) => (unix_now(), relative),
-        None => (0.0, when),
+    let expires = match when.strip_prefix(b"+") {
+        Some(relative) => parse::float_prefix(relative).map(|t| t + unix_now()),
+        None => parse::float_prefix(when).filter(|&t| t != 0.0),
     };
-    let expires = parse::float_prefix(when)
-        .filter(|&t| t != 0.0)
-        .map(|t| t + base);
 
     let filter = IpFilter {
         compare,
@@ -391,12 +389,17 @@ mod tests {
         run(&mut bans, &mut cbuf, b"addip 10.1.1.1 safe");
         run(&mut bans, &mut cbuf, b"addip 10.2.2.2 ban +0.5");
         run(&mut bans, &mut cbuf, b"addip 10.4.4.4 ban 0");
+        run(&mut bans, &mut cbuf, b"addip 10.5.5.5 ban +0");
         assert!(bans.is_banned(addr([192, 246, 40, 7])));
         assert!(!bans.is_banned(addr([192, 246, 41, 7])));
         assert!(!bans.is_banned(addr([10, 1, 1, 1])));
         assert!(bans.is_banned(addr([10, 2, 2, 2])));
-        assert_eq!(bans.filters.len(), 4);
+        assert_eq!(bans.filters.len(), 5);
         assert_eq!(bans.filters[3].expires, None, "0 means permanent");
+        assert!(
+            bans.filters[4].expires.is_some_and(|t| t <= unix_now()),
+            "+0 expires at once"
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(600));
         bans.clean_expired();

@@ -1,7 +1,7 @@
 //! Server-side handling of connectionless packets from clients: challenges,
 //! connection requests, status queries.
 
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
@@ -20,6 +20,9 @@ use crate::{dprint, huff, info, net, parse};
 
 /// Large enough that an attacker cannot cycle out legitimate challenges.
 const MAX_CHALLENGES: usize = 1024;
+/// Host lookups in flight for connect requests, over all clients; beyond
+/// this a connect naming a host is refused until one finishes.
+const MAX_LOOKUPS: usize = 64;
 
 /// A validated connect request waiting for its remote host to be looked up.
 pub struct PendingConnect {
@@ -31,6 +34,14 @@ pub struct PendingConnect {
     pub proto: Protocol,
     /// The challenge the client connected with, for the Q3 reconnect dance.
     pub challenge: i32,
+    /// Which of the client's requests this is; an older one's result is ignored.
+    pub generation: u64,
+}
+
+/// A client's host lookup in flight, and the request that superseded it, if any.
+pub struct LookupSlot {
+    generation: u64,
+    queued: Option<PendingConnect>,
 }
 
 pub struct Challenge {
@@ -366,12 +377,76 @@ impl Proxy {
             qport,
             proto,
             challenge,
+            generation: 0,
         };
+        // Most prx keys name an address, which needs no lookup.
+        if let Ok(ip) = pending.host.parse::<Ipv4Addr>() {
+            self.finish_connect(socket, pending, Some(SocketAddrV4::new(ip, port)));
+            return;
+        }
+        self.queue_lookup(pending);
+    }
+
+    /// Starts the host lookup for a connect request. One lookup runs per
+    /// client at a time: a request arriving while one is in flight waits for
+    /// it and supersedes it, so the newest request is the one applied and a
+    /// client cannot pile up lookups.
+    fn queue_lookup(&mut self, mut pending: PendingConnect) {
+        let from = pending.from;
+        if let Some(slot) = self.lookups.get_mut(&from) {
+            slot.generation += 1;
+            slot.queued = Some(pending);
+            return;
+        }
+        if self.lookups.len() >= MAX_LOOKUPS {
+            dprint!("lookup for {from} refused: {MAX_LOOKUPS} already in flight\n");
+            return;
+        }
+        pending.generation = 1;
+        let slot = LookupSlot {
+            generation: 1,
+            queued: None,
+        };
+        self.lookups.insert(from, slot);
+        self.spawn_lookup(pending);
+    }
+
+    fn spawn_lookup(&self, pending: PendingConnect) {
         let events = self.events.clone();
         tokio::spawn(async move {
             let to = net::resolve(&pending.host, pending.port).await;
             let _ = events.send(Event::ConnectResolved(pending, to)).await;
         });
+    }
+
+    /// A host lookup finished: completes the connect when it is still the
+    /// client's newest request, otherwise starts the one that superseded it.
+    pub(super) fn lookup_finished(
+        &mut self,
+        socket: &UdpSocket,
+        pending: PendingConnect,
+        to: Option<SocketAddrV4>,
+    ) {
+        let from = pending.from;
+        let superseded_by = match self.lookups.get_mut(&from) {
+            None => return,
+            Some(slot) if pending.generation == slot.generation => None,
+            Some(slot) => {
+                let next = slot.queued.take().map(|mut next| {
+                    next.generation = slot.generation;
+                    next
+                });
+                Some(next)
+            }
+        };
+        match superseded_by {
+            Some(Some(next)) => self.spawn_lookup(next),
+            Some(None) => {}
+            None => {
+                self.lookups.remove(&from);
+                self.finish_connect(socket, pending, to);
+            }
+        }
     }
 
     /// Completes a connect request once its remote host is known.

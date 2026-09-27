@@ -33,10 +33,17 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let port = argv
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .filter(|&port| port != 0);
+    let port = match argv.get(1).filter(|s| !s.starts_with(['-', '+'])) {
+        None => None,
+        Some(arg) => match arg.parse::<u16>() {
+            Ok(0) => None,
+            Ok(port) => Some(port),
+            Err(_) => {
+                cprint!("invalid port: {arg}\n");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     let ip = argv
         .get(2)
         .filter(|s| !s.starts_with(['-', '+']))

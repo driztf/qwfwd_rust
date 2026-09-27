@@ -449,6 +449,30 @@ fn tracking_spectator_drop_is_detected() {
 }
 
 #[test]
+fn prx_host_names_are_looked_up_off_the_loop() {
+    let server = FakeServer::start();
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = Client::connect(proxy.addr);
+    let challenge = client.get_challenge();
+    // A name rather than an address goes through the resolver task.
+    let connect = [
+        OOB,
+        b"connect 28 5 ",
+        &challenge[..],
+        b" \"\\name\\p\\prx\\localhost:",
+        server.port.to_string().as_bytes(),
+        b"\"\n",
+    ]
+    .concat();
+    assert_eq!(client.ask(&connect), [OOB, b"j"].concat());
+    wait_until("proxy to log the connection", || {
+        proxy.log().contains(": connection")
+    });
+    let reply = client.ask(&game_packet(b"hello"));
+    assert!(reply.ends_with(b"echo:hello"), "{reply:?}");
+}
+
+#[test]
 fn banned_clients_are_ignored() {
     let proxy = Proxy::start(&format!("{BASE_CONFIG}addip 127.0.0.1\n"), &[]);
     let client = Client::connect(proxy.addr);

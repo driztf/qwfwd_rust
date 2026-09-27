@@ -3,6 +3,7 @@
 
 mod svc;
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
@@ -22,7 +23,7 @@ use crate::query::{self, Query, Resolution};
 use crate::whitelist::{self, Whitelist};
 use crate::{console, cprint, dprint, net};
 
-use svc::{Challenges, PendingConnect};
+use svc::{Challenges, LookupSlot, PendingConnect};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 const CONFIG_NAME: &str = "qwfwd.cfg";
@@ -62,6 +63,8 @@ pub struct Proxy {
     whitelist: Whitelist,
     query: Query,
     challenges: Challenges,
+    /// Connect requests whose host is being looked up, by client address.
+    lookups: HashMap<SocketAddrV4, LookupSlot>,
     peers: Peers,
     events: mpsc::Sender<Event>,
     reload_requested: bool,
@@ -99,6 +102,7 @@ impl Proxy {
             whitelist: Whitelist::default(),
             query: Query::new(),
             challenges: Challenges::default(),
+            lookups: HashMap::new(),
             peers: Peers::default(),
             events,
             reload_requested: false,
@@ -157,7 +161,7 @@ impl Proxy {
                     self.peers.handle_server_packet(socket, packet);
                 }
             }
-            Event::ConnectResolved(pending, to) => self.finish_connect(socket, pending, to),
+            Event::ConnectResolved(pending, to) => self.lookup_finished(socket, pending, to),
             Event::Resolved(resolution) => self.query.apply_resolution(resolution),
             Event::PeerLost { userid, error } => self.peers.lose(userid, &error),
         }

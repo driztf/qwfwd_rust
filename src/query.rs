@@ -82,9 +82,18 @@ fn spawn_resolve(
     events: mpsc::Sender<Event>,
 ) {
     tokio::spawn(async move {
-        let mut results = Vec::with_capacity(targets.len());
-        for (spec, host, port) in targets {
-            results.push((spec, net::resolve(&host, port).await));
+        // All at once, so a dead resolver costs one timeout rather than one per host.
+        let lookups: Vec<_> = targets
+            .into_iter()
+            .map(|(spec, host, port)| {
+                tokio::spawn(async move { (spec, net::resolve(&host, port).await) })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(lookups.len());
+        for lookup in lookups {
+            if let Ok(result) = lookup.await {
+                results.push(result);
+            }
         }
         let resolution = Resolution {
             kind,
