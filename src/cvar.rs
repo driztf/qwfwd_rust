@@ -48,6 +48,10 @@ impl Cvars {
         self.find(name).map_or(0, |v| v.integer)
     }
 
+    pub fn float(&self, name: &str) -> f64 {
+        self.find(name).map_or(0.0, |v| v.value)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Cvar> {
         self.vars.values()
     }

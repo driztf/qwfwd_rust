@@ -44,6 +44,36 @@ config. When attached to a terminal the console accepts commands on stdin with l
 readline bindings; Ctrl-C quits), and ``SIGHUP`` reloads ``qwfwd.cfg``. Run ``cmdlist`` and
 ``cvarlist`` in the console for the full list.
 
+## Connection smoothing
+
+Links such as cellular uplinks deliver QuakeWorld's steady 77 packets/s (one
+every 13 ms) in clumps. The proxy can re-space a client's game packets before
+forwarding them to the server: packets arriving on time pass straight through
+and packets arriving early wait for their slot. Slots run at the client's own
+send rate, measured from its arrivals over the last few seconds;
+``smooth_interval`` ms (default 1000/77) is used until enough have been seen. Any
+slack that builds up in the queue beyond what the clumping needs is drained by
+shortening slots by at most ``smooth_drain`` percent (10), a backlog older than
+``smooth_catchup`` ms drains at double rate, and packets queued longer than ``smooth_maxdelay`` ms are dropped oldest
+first. Clients that send every packet twice for loss protection
+(``cl_c2sdupe``) are fine: a copy rides with its original and takes no slot
+of its own.
+
+The ``smooth`` cvar sets who gets smoothed: ``0`` nobody, ``1`` (default)
+clients that opt in with ``setinfo smooth 1``, ``2`` everyone except clients
+that set ``setinfo smooth 0``. Only QuakeWorld clients are smoothed; Quake III
+traffic is passed straight through. Clients can change the setting at any time,
+also while connected; it takes effect on the next packet.
+
+``clstats`` shows, per client over the last 5 seconds, the average, standard
+deviation and maximum gap between packets as they arrive from the client and
+as they leave for the server, the time packets spent queued, duplicates and
+drops — so you can see a client's jitter before deciding to smooth it. ``cllist`` shows
+queue depth and total drops.
+
+Run the proxy close to the server (on the good side of the bad link) for this
+to help; a proxy on the far side would only see the clumps after the fact.
+
 ## Development
 
 ```bash
