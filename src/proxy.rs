@@ -206,6 +206,8 @@ pub async fn run(params: Params) -> Result<(), String> {
     proxy.shell.stuff_cmds(&params.argv);
     proxy.execute_buffer();
 
+    let mut timer = timer::Timer::new();
+    cprint!("smoothing releases timed by {}\n", timer.description());
     cprint!(
         "qwfwd: ready to rock at {}:{}\n",
         proxy.shell.cvars.string("net_ip"),
@@ -215,7 +217,6 @@ pub async fn run(params: Params) -> Result<(), String> {
     let (mut console_rx, console_ack) = spawn_console();
     let mut hangup = hangup_signal()?;
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
-    let mut timer = timer::Timer::new();
     let mut msg = Vec::with_capacity(MSG_BUF_SIZE);
 
     while !proxy.shell.exit_requested() {
