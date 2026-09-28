@@ -73,9 +73,10 @@ python3 bench/bench.py --proxy target/release/qwfwd --userinfo '\smooth\1' --tim
 ```
 
 Needs Python 3.9+, Linux (for `/proc`), CMake and a C compiler for the
-original, and a Rust toolchain. Refs default to `master`,
-`rust-port-and-tests`, `rust-modernization` and `rust-smoothing` and can be
-overridden with `C_REF`, `PORT_REF`, `MODERN_REF` and `SMOOTH_REF`.
+original, and a Rust toolchain. Refs default to the last commit of the C
+original, the port and the modernization as merged, and `master` for the
+smoothing build, and can be overridden with `C_REF`, `PORT_REF`,
+`MODERN_REF` and `SMOOTH_REF`.
 
 ## Reading the numbers
 
@@ -95,24 +96,36 @@ overridden with `C_REF`, `PORT_REF`, `MODERN_REF` and `SMOOTH_REF`.
 
 ## Results
 
-Built from C 576214f (master), port d8304d1, modern b1097ba and smooth
-5343a61 with `bench/run.sh` defaults: 16 clients at 77 packets/s for 20 s,
-median of 3 runs, on 2026-09-27.
+Built from the C original at 576214f, the port as merged (bcff74e), the
+modernization as merged (53af5c5) and the smoothing build with the
+high-resolution timer and rate snap (c8d4c28, branch `hires-timer`) with
+`bench/run.sh` defaults: 16 clients at 77 packets/s for 20 s, median of
+3 runs, on 2026-09-28. The `master-*` rows are the smoothing build as
+merged on master (f15f4de), before the timer and snap, run the same way
+for comparison, and the `*-64-*` rows repeat the smoothing rows with 64
+clients, median of 2 runs.
 
 | run | runs | clients | clump ms | pause ms | sent | loss % | rtt avg | p50 | p99 | max | arrival sd | cpu % | µs/pkt | ctxt/s | thr | peak rss MB |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| direct | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.089 | 0.061 | 0.308 | 0.58 | 0.07 |  |  |  |  |  |
-| c | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.147 | 0.113 | 0.419 | 0.84 | 0.07 | 6.5 | 26.92 | 2408 | 1 | 2.4 |
-| port | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.143 | 0.112 | 0.412 | 0.73 | 0.07 | 6.1 | 25.44 | 2399 | 1 | 2.9 |
-| modern | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.141 | 0.111 | 0.405 | 0.68 | 0.07 | 5.5 | 22.96 | 2411 | 1 | 3.1 |
-| smooth-off | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.146 | 0.113 | 0.419 | 0.94 | 0.07 | 5.9 | 24.64 | 2411 | 1 | 3.8 |
-| smooth-on | 3 | 16 | 0 | 0 | 24640 | 0.00 | 1.960 | 1.819 | 3.434 | 3.95 | 0.36 | 6.2 | 25.99 | 1948 | 1 | 4.0 |
-| smooth-on-pause | 3 | 16 | 0 | 100 | 24640 | 0.00 | 7.462 | 2.010 | 58.608 | 64.44 | 0.57 | 6.3 | 26.14 | 1920 | 1 | 4.2 |
-| direct-clumped | 3 | 16 | 20 | 0 | 24640 | 0.00 | 0.729 | 0.614 | 2.162 | 3.81 | 9.51 |  |  |  |  |  |
-| smooth-off-clumped | 3 | 16 | 20 | 0 | 24640 | 0.00 | 0.795 | 0.720 | 2.032 | 3.14 | 9.51 | 3.4 | 14.20 | 534 | 1 | 3.9 |
-| smooth-on-clumped | 3 | 16 | 20 | 0 | 24640 | 0.00 | 11.123 | 11.172 | 21.493 | 22.98 | 0.58 | 5.7 | 23.69 | 1708 | 1 | 4.2 |
+| direct | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.092 | 0.066 | 0.312 | 1.01 | 0.07 |  |  |  |  |  |
+| c | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.151 | 0.130 | 0.413 | 1.51 | 0.07 | 6.8 | 28.07 | 2425 | 1 | 2.4 |
+| port | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.141 | 0.130 | 0.409 | 1.35 | 0.07 | 6.0 | 24.83 | 2414 | 1 | 3.0 |
+| modern | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.151 | 0.125 | 0.418 | 0.82 | 0.07 | 6.0 | 24.83 | 2417 | 1 | 3.1 |
+| smooth-off | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.151 | 0.124 | 0.419 | 1.57 | 0.07 | 6.2 | 25.90 | 2422 | 1 | 3.9 |
+| smooth-on | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.285 | 0.272 | 0.580 | 0.87 | 0.05 | 8.1 | 33.83 | 3576 | 1 | 4.3 |
+| smooth-on-pause | 3 | 16 | 0 | 100 | 24640 | 0.00 | 3.239 | 0.320 | 35.662 | 42.46 | 0.28 | 8.2 | 34.28 | 3521 | 1 | 4.3 |
+| direct-clumped | 3 | 16 | 20 | 0 | 24640 | 0.00 | 0.742 | 0.616 | 2.067 | 3.40 | 9.51 |  |  |  |  |  |
+| smooth-off-clumped | 3 | 16 | 20 | 0 | 24640 | 0.00 | 0.840 | 0.781 | 2.147 | 3.26 | 9.51 | 3.6 | 14.93 | 652 | 1 | 4.0 |
+| smooth-on-clumped | 3 | 16 | 20 | 0 | 24640 | 0.00 | 9.710 | 9.825 | 19.754 | 21.12 | 0.11 | 7.7 | 31.93 | 2674 | 1 | 4.3 |
+| master-smooth-off | 3 | 16 | 0 | 0 | 24640 | 0.00 | 0.154 | 0.129 | 0.425 | 0.77 | 0.08 | 6.3 | 26.23 | 2416 | 1 | 3.9 |
+| master-smooth-on | 3 | 16 | 0 | 0 | 24640 | 0.00 | 1.961 | 1.825 | 3.433 | 3.90 | 0.36 | 6.8 | 28.07 | 1974 | 1 | 4.2 |
+| master-64-smooth-off | 2 | 64 | 0 | 0 | 98560 | 0.00 | 0.147 | 0.127 | 0.504 | 2.84 | 0.10 | 21.4 | 22.28 | 9323 | 1 | 6.6 |
+| master-64-smooth-on | 2 | 64 | 0 | 0 | 98560 | 0.00 | 1.898 | 1.901 | 3.094 | 7.69 | 0.27 | 21.7 | 22.59 | 5661 | 1 | 7.7 |
+| smooth-64-smooth-off | 2 | 64 | 0 | 0 | 98560 | 0.00 | 0.147 | 0.129 | 0.478 | 2.15 | 0.09 | 22.2 | 23.11 | 9327 | 1 | 6.6 |
+| smooth-64-smooth-on | 2 | 64 | 0 | 0 | 98560 | 0.00 | 0.337 | 0.315 | 0.831 | 3.77 | 0.07 | 28.6 | 29.78 | 11010 | 1 | 7.6 |
 
-Latency in ms, round trip client to server and back. matt-desktop: Intel(R) Core(TM) i7-14700F, Linux 7.2.3-1-cachyos, Python 3.14.7.
+Latency in ms, round trip client to server and back. matt-desktop:
+Intel Core i7-14700F, Linux 7.2.3, Python 3.14.
 
 ### What the numbers say
 
@@ -121,46 +134,53 @@ Latency in ms, round trip client to server and back. matt-desktop: Intel(R) Core
 within a few microseconds of each other: the forwarding path is not where
 time goes. Against a real link's tens of milliseconds this is nothing.
 
-**CPU.** Per packet handled, the plain port costs the same as the C
-original (25 versus 27 µs), the modernized port about 15 % less, and the
-smoothing build sits between them whether or not clients are smoothed.
-At 16 players each build needs around 6 % of one core, and the cost is
-almost entirely the wake-up per packet (the context switch column matches
-the packet rate), so it scales with packets rather than with what is done
-to them. The clumped rows show this from the other side: when two packets
-arrive per wake-up, the cost per packet halves. In absolute terms a 32
-player server would keep any of these builds near a tenth of a core.
+**CPU.** Per packet handled, the plain port and the modernized port cost
+about 12 % less than the C original (25 versus 28 µs), and the smoothing
+build with no client opted in the same as the port. At 16 players each
+build needs 6 to 7 % of one core, and the cost is almost entirely the
+wake-up per packet (the context switch column matches the packet rate),
+so it scales with packets rather than with what is done to them. The
+clumped rows show this from the other side: when two packets arrive per
+wake-up, the cost per packet halves.
 
 **Memory.** The C original holds 2.4 MB resident, the Rust builds 3 to
 3.1 MB, and the smoothing build about 4 MB because it keeps five seconds of
-timing samples per client for `clstats` and the rate estimate.
+timing samples per client for `clstats` and the rate estimate; 6.6 to
+7.7 MB at 64 clients.
 
 **Smoothing on a clumped link.** With packets leaving in 20 ms slots the
 server sees arrival gaps with a 9.5 ms standard deviation; smoothing brings
-that to 0.6 ms, at the cost of holding packets for about half a slot, 10 ms
-on average and 21 ms at the 99th percentile. That is the intended trade.
+that to 0.1 ms, at the cost of holding packets for about half a slot, 10 ms
+on average and 20 ms at the 99th percentile. That is the intended trade.
 
-**Smoothing on a clean link.** A client that opts in without needing to
-pays about 1.8 ms average and 4 ms worst case, from the proxy's 1 ms timer
-granularity plus the slack the rate estimate's safety margin builds before
-each drain. Its arrivals at the server also become slightly less regular
-(0.36 ms against 0.07). This is the argument for keeping smoothing opt-in
-by default in the proxy.
+**Smoothing on a clean link, and the high-resolution timer.** The
+smoothing build as first merged waited for release slots with tokio's
+timer, whose 1 ms resolution rounds every deadline up; an opted-in client
+on a clean link paid about 1.9 ms and its arrivals at the server were
+less regular than without a proxy (`master-smooth-on`). With the kernel's
+high-resolution timer and the rate snap (`smooth-on`) that client pays
+0.13 ms over an unsmoothed one, its 99th percentile is 0.58 ms, and its
+arrivals are as regular as on the direct link. The price is that every
+release is its own wake-up where the millisecond rounding used to batch
+a few: about 30 % more CPU per packet for smoothed clients, 1.3 points of
+a core at 16 smoothed clients and 7 points at 64. Unsmoothed clients cost
+exactly what they did (`smooth-off` against `master-smooth-off`, at both
+16 and 64 clients).
 
-**A silence before traffic is costly.** `smooth-on-pause` sends the same
-steady traffic after 100 ms of silence, which is what a client loading a
-map produces. That single gap sits in the five second rate window, raises
-the mean arrival gap and so the release interval by several percent, and
-the queue grows into catch-up: waits reach 64 ms and the 99th percentile
-is 59 ms until the gap ages out of the window about five seconds later.
-`--timeline` shows the shape: fine in the first second on the configured
-interval, a spike as the measured interval takes over, then settling. Two
-changes would fix it and are worth doing before smoothing is relied on
-right after a map change: leave gaps well above the client's interval out
-of the rate estimate, since they are stalls rather than rate, and measure
-the rate over a longer window than the statistics, since a client's rate
-is constant and the configured 1000/77 ms is already right for every
-stock QuakeWorld client.
+**A silence before traffic is still costly.** `smooth-on-pause` sends the
+same steady traffic after 100 ms of silence, which is what a client
+loading a map produces. That single gap sits in the five second rate
+window, raises the mean arrival gap and so the release interval by
+several percent, and the queue grows into catch-up: waits reach 42 ms and
+the 99th percentile is 36 ms until the gap ages out of the window about
+five seconds later. The rate snap softens this (it was 64 and 59 ms
+before) but does not remove it. `--timeline` shows the shape: fine in the
+first second on the configured interval, a spike as the measured interval
+takes over, then settling. Two changes would fix it and are worth doing
+before smoothing is relied on right after a map change: leave gaps well
+above the client's interval out of the rate estimate, since they are
+stalls rather than rate, and measure the rate over a longer window than
+the statistics, since a client's rate is constant.
 
 ## Caveats
 
