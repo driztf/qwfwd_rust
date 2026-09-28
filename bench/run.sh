@@ -5,7 +5,10 @@
 #   bench/run.sh                 # everything, into target/bench
 #   OUT=/tmp/b CLIENTS=64 bench/run.sh
 #
-# Refs can be overridden with C_REF, PORT_REF, MODERN_REF and SMOOTH_REF.
+# Refs can be overridden with C_REF, PORT_REF, MODERN_REF and SMOOTH_REF. The
+# defaults are commits rather than branches, since the branches go away once
+# merged: the last commit of the C original, the port as merged, the
+# modernization as merged, and master for the smoothing build.
 set -euo pipefail
 
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -14,10 +17,10 @@ OUT=${OUT:-$REPO/target/bench}
 CLIENTS=${CLIENTS:-16}
 DURATION=${DURATION:-20}
 REPEATS=${REPEATS:-3}
-C_REF=${C_REF:-master}
-PORT_REF=${PORT_REF:-rust-port-and-tests}
-MODERN_REF=${MODERN_REF:-rust-modernization}
-SMOOTH_REF=${SMOOTH_REF:-rust-smoothing}
+C_REF=${C_REF:-576214f}
+PORT_REF=${PORT_REF:-bcff74e}
+MODERN_REF=${MODERN_REF:-53af5c5}
+SMOOTH_REF=${SMOOTH_REF:-master}
 
 mkdir -p "$OUT/bin" "$OUT/src"
 
