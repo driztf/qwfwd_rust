@@ -6,7 +6,7 @@ mod svc;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -22,7 +22,7 @@ use crate::peer::{self, PeerPacket, Peers};
 use crate::protocol::{QWFWD_DEFAULT_PORT, QWFWD_URL, QWFWD_VERSION, QWFWD_VERSION_SHORT};
 use crate::query::{self, Query, Resolution};
 use crate::whitelist::{self, Whitelist};
-use crate::{console, cprint, dprint, net};
+use crate::{console, cprint, dprint, net, timer};
 
 use svc::{Challenges, LookupSlot, PendingConnect};
 
@@ -215,12 +215,13 @@ pub async fn run(params: Params) -> Result<(), String> {
     let (mut console_rx, console_ack) = spawn_console();
     let mut hangup = hangup_signal()?;
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
+    let mut timer = timer::Timer::new();
     let mut msg = Vec::with_capacity(MSG_BUF_SIZE);
 
     while !proxy.shell.exit_requested() {
         msg.resize(MSG_BUF_SIZE, 0);
         // Wake exactly when the next smoothed packet is due, not on the tick.
-        let pacer_deadline = proxy.peers.next_deadline().map(tokio::time::Instant::from);
+        let pacer_deadline = proxy.peers.next_deadline();
         tokio::select! {
             received = socket.recv_from(&mut msg) => match received {
                 Ok((len, from)) => {
@@ -249,7 +250,7 @@ pub async fn run(params: Params) -> Result<(), String> {
             }
             _ = hangup.recv() => proxy.reload_requested = true,
             _ = ticker.tick() => proxy.tick(&socket),
-            _ = tokio::time::sleep_until(pacer_deadline.unwrap_or_else(tokio::time::Instant::now)),
+            _ = timer.sleep_until(pacer_deadline.unwrap_or_else(Instant::now)),
                 if pacer_deadline.is_some() => proxy.peers.flush(&proxy.smoothing),
         }
     }

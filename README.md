@@ -72,7 +72,9 @@ drops — so you can see a client's jitter before deciding to smooth it. ``cllis
 queue depth and total drops.
 
 Run the proxy close to the server (on the good side of the bad link) for this
-to help; a proxy on the far side would only see the clumps after the fact.
+to help; a proxy on the far side would only see the clumps after the fact. On
+Linux releases are timed with the kernel's high-resolution timers; elsewhere
+they are rounded up to the next millisecond.
 
 ## Development
 
