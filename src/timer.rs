@@ -35,6 +35,15 @@ impl Timer {
         Timer { fine }
     }
 
+    /// What times the releases, for the startup message.
+    pub fn description(&self) -> &'static str {
+        if self.fine.is_some() {
+            "the kernel's high-resolution timer"
+        } else {
+            "the runtime's millisecond timer"
+        }
+    }
+
     /// Waits until `at`; a deadline already passed returns at once.
     pub async fn sleep_until(&mut self, at: Instant) {
         if let Some(fine) = &mut self.fine
