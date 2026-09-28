@@ -215,7 +215,7 @@ pub async fn run(params: Params) -> Result<(), String> {
     let (mut console_rx, console_ack) = spawn_console();
     let mut hangup = hangup_signal()?;
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
-    let mut timer = timer::Timer::new().map_err(|err| format!("deadline timer: {err}"))?;
+    let mut timer = timer::Timer::new();
     let mut msg = Vec::with_capacity(MSG_BUF_SIZE);
 
     while !proxy.shell.exit_requested() {
@@ -250,11 +250,8 @@ pub async fn run(params: Params) -> Result<(), String> {
             }
             _ = hangup.recv() => proxy.reload_requested = true,
             _ = ticker.tick() => proxy.tick(&socket),
-            woke = timer.sleep_until(pacer_deadline.unwrap_or_else(Instant::now)),
-                if pacer_deadline.is_some() => {
-                    woke.map_err(|err| format!("deadline timer: {err}"))?;
-                    proxy.peers.flush(&proxy.smoothing);
-                }
+            _ = timer.sleep_until(pacer_deadline.unwrap_or_else(Instant::now)),
+                if pacer_deadline.is_some() => proxy.peers.flush(&proxy.smoothing),
         }
     }
 

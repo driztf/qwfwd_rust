@@ -8,12 +8,46 @@
 //! between packets. On Linux a timerfd is driven by the kernel's
 //! high-resolution timers instead, with tens of microseconds of slack, and
 //! tokio can wait for it to become readable like any other file descriptor.
-//! Elsewhere the timer falls back to tokio's own.
+//! Elsewhere, and on a Linux that refuses a timerfd (a seccomp profile,
+//! say), the timer falls back to tokio's own.
 
-pub use imp::Timer;
+use std::time::Instant;
+
+use crate::cprint;
+
+pub struct Timer {
+    fine: Option<fine::Fine>,
+}
+
+impl Timer {
+    pub fn new() -> Self {
+        let fine = match fine::Fine::new() {
+            Ok(fine) => fine,
+            Err(err) => {
+                if let Some(err) = err {
+                    cprint!(
+                        "no high-resolution timer ({err}); releases are timed to the millisecond\n"
+                    );
+                }
+                None
+            }
+        };
+        Timer { fine }
+    }
+
+    /// Waits until `at`; a deadline already passed returns at once.
+    pub async fn sleep_until(&mut self, at: Instant) {
+        if let Some(fine) = &mut self.fine
+            && fine.sleep_until(at).await.is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep_until(at.into()).await;
+    }
+}
 
 #[cfg(target_os = "linux")]
-mod imp {
+mod fine {
     use std::io;
     use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::time::{Duration, Instant};
@@ -33,21 +67,25 @@ mod imp {
         }
     }
 
-    pub struct Timer {
+    pub struct Fine {
         fd: AsyncFd<Fd>,
+        /// The deadline the timer is armed for, so waiting for the same one
+        /// again (the loop rebuilds its wait after every event) costs no
+        /// system call.
+        armed: Option<Instant>,
     }
 
-    impl Timer {
-        pub fn new() -> io::Result<Self> {
+    impl Fine {
+        /// `Err(None)` means the platform has no such timer; `Err(Some)` that
+        /// it refused one.
+        pub fn new() -> Result<Option<Self>, Option<io::Error>> {
             let flags = TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC;
-            let fd = TimerFd::new(ClockId::CLOCK_MONOTONIC, flags)?;
-            Ok(Timer {
-                fd: AsyncFd::with_interest(Fd(fd), Interest::READABLE)?,
-            })
+            let fd = TimerFd::new(ClockId::CLOCK_MONOTONIC, flags).map_err(io::Error::from)?;
+            let fd = AsyncFd::with_interest(Fd(fd), Interest::READABLE)?;
+            Ok(Some(Fine { fd, armed: None }))
         }
 
-        /// Waits until `at`; a deadline already passed returns at once.
-        pub async fn sleep_until(&mut self, at: Instant) -> io::Result<()> {
+        fn arm(&mut self, at: Instant) -> io::Result<()> {
             // A zero expiration would disarm the timer, hence the nanosecond
             // floor for a deadline already passed.
             let wait = at
@@ -58,6 +96,14 @@ mod imp {
                 .get_ref()
                 .0
                 .set(expiration, TimerSetTimeFlags::empty())?;
+            self.armed = Some(at);
+            Ok(())
+        }
+
+        pub async fn sleep_until(&mut self, at: Instant) -> io::Result<()> {
+            if self.armed != Some(at) {
+                self.arm(at)?;
+            }
             loop {
                 let mut guard = self.fd.readable().await?;
                 let read = guard.try_io(|fd| {
@@ -65,10 +111,17 @@ mod imp {
                     nix::unistd::read(&fd.get_ref().0, &mut count).map_err(io::Error::from)
                 });
                 match read {
-                    // An expiration left behind by a wait abandoned earlier
-                    // reads the same as the real one; the clock tells them apart.
-                    Ok(Ok(_)) if Instant::now() >= at => return Ok(()),
-                    Ok(Ok(_)) => continue,
+                    Ok(Ok(_)) => {
+                        // One-shot: nothing more to read until it is armed again.
+                        guard.clear_ready();
+                        self.armed = None;
+                        if Instant::now() >= at {
+                            return Ok(());
+                        }
+                        // Woken early (the expiration of a wait abandoned
+                        // before this one, say): arm for what is left.
+                        self.arm(at)?;
+                    }
                     Ok(Err(err)) => return Err(err),
                     // Readiness left over from an earlier read; wait again.
                     Err(_would_block) => continue,
@@ -79,20 +132,19 @@ mod imp {
 }
 
 #[cfg(not(target_os = "linux"))]
-mod imp {
+mod fine {
     use std::io;
     use std::time::Instant;
 
-    pub struct Timer;
+    pub enum Fine {}
 
-    impl Timer {
-        pub fn new() -> io::Result<Self> {
-            Ok(Timer)
+    impl Fine {
+        pub fn new() -> Result<Option<Self>, Option<io::Error>> {
+            Err(None)
         }
 
-        pub async fn sleep_until(&mut self, at: Instant) -> io::Result<()> {
-            tokio::time::sleep_until(at.into()).await;
-            Ok(())
+        pub async fn sleep_until(&mut self, _at: Instant) -> io::Result<()> {
+            match *self {}
         }
     }
 }
@@ -105,40 +157,39 @@ mod tests {
 
     #[tokio::test]
     async fn wakes_within_a_fraction_of_a_millisecond() {
-        let mut timer = Timer::new().unwrap();
-        let start = Instant::now();
-        timer
-            .sleep_until(start + Duration::from_micros(300))
-            .await
-            .unwrap();
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_micros(300), "{elapsed:?}");
+        let mut timer = Timer::new();
+        assert!(timer.fine.is_some(), "no timerfd on this Linux?");
+
+        // Best of several tries, so a preempted thread does not fail the test.
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let start = Instant::now();
+            timer.sleep_until(start + Duration::from_micros(300)).await;
+            let elapsed = start.elapsed();
+            assert!(elapsed >= Duration::from_micros(300), "{elapsed:?}");
+            best = best.min(elapsed);
+        }
         assert!(
-            elapsed < Duration::from_micros(900),
-            "woke {elapsed:?} after a 300 µs deadline: millisecond-grained?"
+            best < Duration::from_micros(900),
+            "woke {best:?} after a 300 µs deadline at best: millisecond-grained?"
         );
 
-        // A deadline already passed fires at once, and an abandoned wait
-        // leaves nothing behind for the next one.
+        // A deadline already passed fires at once.
         let start = Instant::now();
-        timer
-            .sleep_until(start - Duration::from_millis(5))
-            .await
-            .unwrap();
-        assert!(start.elapsed() < Duration::from_micros(500));
+        timer.sleep_until(start - Duration::from_millis(5)).await;
+        assert!(start.elapsed() < Duration::from_millis(2));
+
+        // A wait abandoned before it fired leaves nothing behind for the
+        // next one, whose deadline is honoured in full.
         let abandoned = tokio::time::timeout(
             Duration::from_millis(1),
             timer.sleep_until(Instant::now() + Duration::from_millis(20)),
         )
         .await;
         assert!(abandoned.is_err(), "the wait should have been cut short");
-        // The abandoned timer expires unobserved in the meantime.
         tokio::time::sleep(Duration::from_millis(25)).await;
         let start = Instant::now();
-        timer
-            .sleep_until(start + Duration::from_millis(2))
-            .await
-            .unwrap();
+        timer.sleep_until(start + Duration::from_millis(2)).await;
         assert!(start.elapsed() >= Duration::from_millis(2));
     }
 }

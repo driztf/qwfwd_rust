@@ -11,7 +11,7 @@
 //! run at the client's rate and the queue holds only what the clumping needs.
 //! Whatever slack builds up beyond that, because the estimate is a touch long
 //! or a stall let the queue grow, is found as the smallest wait over the last
-//! quarter second and shaved off the following slots a little at a time. Once a
+//! half second and shaved off the following slots a little at a time. Once a
 //! backlog grows past a threshold the queue drains at double rate to recover
 //! from a latency burst, and packets that have waited past a hard limit are
 //! discarded, oldest first, so the remote end skips ahead rather than falling
@@ -96,14 +96,18 @@ const MIN_RATE_SPAN_MS: f64 = 1000.0;
 /// only builds slack, which is drained, while a short one runs the queue dry
 /// and re-syncs the schedule to a clumped arrival.
 const RATE_MARGIN: f64 = 1.002;
-/// A client measured this close to the configured rate is taken to be
-/// exactly at it. The measurement wobbles by a few tenths of a percent as
-/// clumps enter and leave the window, and a stock QuakeWorld client sends
-/// at precisely the configured rate, so using it as is spares that client
-/// the margin and the slack it builds.
-const RATE_SNAP: f64 = 0.005;
+/// A client measured at the configured rate, up to this much faster or a
+/// sliver slower, is taken to be exactly at it. A stock QuakeWorld client
+/// sends at precisely the configured rate, so using it as is spares that
+/// client the margin and the slack it builds. The measurement of it wobbles
+/// by a few tenths of a percent as clumps enter and leave the window, which
+/// the faster side covers; the slower side is kept to what a clean link's
+/// noise needs, since a schedule shorter than the client's interval drains
+/// the buffer a clumped link relies on, and that must stay negligible.
+const RATE_SNAP_FASTER: f64 = 0.005;
+const RATE_SNAP_SLOWER: f64 = 0.0005;
 /// How often the slack in the queue is measured and scheduled for draining.
-const SLACK_PERIOD: Duration = Duration::from_millis(250);
+const SLACK_PERIOD: Duration = Duration::from_millis(500);
 /// Slack is shaved off each slot by this share of what is left, so a lot of
 /// slack goes quickly and the last of it gently, between a floor (as a
 /// fraction of the interval) and the configured cap.
@@ -147,7 +151,9 @@ impl Pacer {
             return config.interval;
         }
         let configured_ms = config.interval.as_secs_f64() * 1000.0;
-        if (mean_ms - configured_ms).abs() <= configured_ms * RATE_SNAP {
+        let snap =
+            configured_ms * (1.0 - RATE_SNAP_FASTER)..=configured_ms * (1.0 + RATE_SNAP_SLOWER);
+        if snap.contains(&mean_ms) {
             return config.interval;
         }
         Duration::from_secs_f64((mean_ms * RATE_MARGIN / 1000.0).clamp(0.001, 1.0))
@@ -778,6 +784,24 @@ mod tests {
             t += Duration::from_micros(12_960);
         }
         assert_eq!(pacer.interval(t, &cfg), cfg.interval);
+        // 13.003 ms gaps are within a clean link's noise of the rate and snap too.
+        let mut pacer = Pacer::default();
+        let mut t = t0;
+        for id in 0..=100u8 {
+            pacer.push(t, &[id], Some(&cfg));
+            t += Duration::from_micros(13_003);
+        }
+        assert_eq!(pacer.interval(t, &cfg), cfg.interval);
+        // 13.04 ms gaps are slower by more than that: snapping would release
+        // faster than the client sends, so the measured interval stands.
+        let mut pacer = Pacer::default();
+        let mut t = t0;
+        for id in 0..=100u8 {
+            pacer.push(t, &[id], Some(&cfg));
+            t += Duration::from_micros(13_040);
+        }
+        let measured = pacer.interval(t, &cfg).as_secs_f64() * 1000.0;
+        assert!((measured - 13.04 * RATE_MARGIN).abs() < 1e-6, "{measured}");
         // 12 ms gaps are a different rate and get the measured interval.
         let mut pacer = Pacer::default();
         let mut t = t0;
@@ -876,7 +900,7 @@ mod tests {
             }
         }
         // 39 ms of slack goes at up to 10% of a slot per packet once the first
-        // quarter-second period is over.
+        // half-second period is over.
         let empty_at = empty_at.expect("queue never drained");
         assert!(
             empty_at <= Duration::from_millis(1500),
