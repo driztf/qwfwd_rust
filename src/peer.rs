@@ -14,13 +14,17 @@ use crate::cmd::Args;
 use crate::console::qstr;
 use crate::msg::{MSG_BUF_SIZE, MsgReader, MsgWriter};
 use crate::pacer::{Pacer, Push, Smoothing};
-use crate::protocol::{CLC_STRINGCMD, NETCHAN_HEADER};
+use crate::protocol::{A2C_PRINT, CLC_STRINGCMD, NETCHAN_HEADER, S2C_CONNECTION};
 use crate::proxy::Event;
 use crate::{cprint, dprint, info, net, parse};
 
 /// Clients silent this long are dropped.
 const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 const CHALLENGE_RESEND: Duration = Duration::from_secs(2);
+/// How long a QW client waits for the remote server to accept before it is
+/// told the server is not answering: after one challenge resend, and before
+/// ezQuake retries the connect at 5 s.
+const NO_ANSWER_NOTICE: Duration = Duration::from_secs(3);
 /// Q3 idle probe: after this much silence, poke the server so it tells us if it dropped the client.
 const Q3_IDLE: Duration = Duration::from_secs(1);
 const Q3_PROBE_INTERVAL: Duration = Duration::from_millis(50);
@@ -67,6 +71,12 @@ pub struct Peer {
     connected_at: Instant,
     last_challenge_at: Option<Instant>,
     last_q3_probe_at: Option<Instant>,
+    /// A QW client whose connect waits for the remote server to accept: it
+    /// is told `j` only once the server has, so a dead or wrong server leaves
+    /// it retrying the connect rather than stuck half connected.
+    accept_pending: bool,
+    /// Whether that client has been told the server is not answering.
+    no_answer_told: bool,
     /// Smoothing queue for game packets headed to the remote server.
     upstream: Pacer,
 }
@@ -273,6 +283,7 @@ impl Peers {
                 }
                 peer.qport = qport;
                 peer.proto = proto;
+                peer.no_answer_told = false;
                 peer.apply_userinfo(userinfo);
                 peer.upstream.clear();
                 peer.last_seen = now;
@@ -307,6 +318,8 @@ impl Peers {
             connected_at: now,
             last_challenge_at: None,
             last_q3_probe_at: None,
+            accept_pending: false,
+            no_answer_told: false,
             upstream: Pacer::default(),
         };
         peer.apply_userinfo(userinfo);
@@ -384,6 +397,11 @@ impl Peers {
                 if peer.cl_connectionless(&packet.data) {
                     net::send(socket, &packet.data, peer.from);
                 }
+                // The server accepted: only now may the client consider itself connected.
+                if peer.accept_pending && peer.state == PeerState::Connected {
+                    peer.accept_pending = false;
+                    net::send_oob_print(socket, peer.from, &(S2C_CONNECTION as char).to_string());
+                }
             }
             Some(_) if peer.state == PeerState::Connected => {
                 net::send(socket, &packet.data, peer.from);
@@ -392,10 +410,35 @@ impl Peers {
         }
     }
 
-    /// Times out silent peers, re-sends pending challenges and probes idle Q3 servers.
-    pub fn maintenance(&mut self) {
+    /// A QW client's connect was accepted by the proxy. It is told `j` once
+    /// the remote server accepts the proxy's own connect, not before.
+    pub fn await_accept(&mut self, index: usize) {
+        if let Some(peer) = self.list.get_mut(index) {
+            peer.accept_pending = true;
+            peer.no_answer_told = false;
+        }
+    }
+
+    /// Times out silent peers, re-sends pending challenges, probes idle Q3
+    /// servers and tells clients whose server is not answering. `socket` is
+    /// the proxy's own, which clients hear from.
+    pub fn maintenance(&mut self, socket: &UdpSocket) {
         let now = Instant::now();
         for peer in &mut self.list {
+            if peer.accept_pending
+                && !peer.no_answer_told
+                && peer.state == PeerState::Challenge
+                && now.duration_since(peer.connected_at) >= NO_ANSWER_NOTICE
+            {
+                peer.no_answer_told = true;
+                dprint!("peer {}: no answer from {}\n", peer.from, peer.to);
+                let notice = format!(
+                    "{}\nno response from server {}\n",
+                    A2C_PRINT as char, peer.to
+                );
+                net::send_oob(socket, peer.from, notice.as_bytes());
+            }
+
             if peer.proto == Protocol::Q3
                 && peer.state == PeerState::Connected
                 && now.duration_since(peer.last_seen) > Q3_IDLE

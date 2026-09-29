@@ -13,7 +13,7 @@ use crate::peer::{PeerState, Protocol, Registration};
 use crate::protocol::{
     A2A_ACK, A2A_PING, A2C_PRINT, Q3_CONNECT_PAYLOAD, Q3_DEFAULT_SERVER_PORT,
     QW_DEFAULT_SERVER_PORT, QW_PROTOCOL_VERSION, QW_VERSION, QWFWD_PRX_KEY, QWFWD_VERSION_SHORT,
-    S2C_CHALLENGE, S2C_CONNECTION,
+    S2C_CHALLENGE,
 };
 use crate::query::Query;
 use crate::{dprint, huff, info, net, parse};
@@ -486,9 +486,8 @@ impl Proxy {
         dprint!("peer {from} added or reused\n");
 
         match proto {
-            Protocol::Qw => {
-                net::send_oob_print(socket, from, &(S2C_CONNECTION as char).to_string())
-            }
+            // The client hears `j` once the remote server has accepted too.
+            Protocol::Qw => self.peers.await_accept(index),
             Protocol::Q3 => {
                 let Some(peer) = self.peers.get_index(index) else {
                     return;
