@@ -155,7 +155,7 @@ impl Proxy {
         }
         self.execute_buffer();
         self.peers.flush(&self.smoothing);
-        self.peers.maintenance();
+        self.peers.maintenance(socket);
         self.peers.drop_dead();
         self.query.frame(
             &mut self.shell.cvars,

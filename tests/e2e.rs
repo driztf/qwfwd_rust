@@ -689,6 +689,44 @@ fn prx_host_names_are_looked_up_off_the_loop() {
 }
 
 #[test]
+fn connecting_to_a_dead_server_is_not_accepted() {
+    let proxy = Proxy::start(BASE_CONFIG, &[]);
+    let client = Client::connect(proxy.addr);
+    let challenge = client.get_challenge();
+    // Nothing listens on this port: the proxy's own connect goes unanswered.
+    let dead_port = free_port();
+    let connect = [
+        OOB,
+        b"connect 28 5 ",
+        &challenge[..],
+        b" \"\\name\\p\\prx\\127.0.0.1:",
+        dead_port.to_string().as_bytes(),
+        b"\"\n",
+    ]
+    .concat();
+    client.send(&connect);
+
+    // The client must not be told it is connected, so it keeps retrying;
+    // after a few seconds it is told why.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let notice = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no notice that the server is not answering"
+        );
+        match client.try_recv() {
+            Some(reply) => {
+                assert_ne!(reply, [OOB, b"j"].concat(), "accepted a dead server");
+                break reply;
+            }
+            None => continue,
+        }
+    };
+    assert!(notice.starts_with(&[OOB, b"n"].concat()), "{notice:?}");
+    assert!(contains(&notice, b"no response from server"), "{notice:?}");
+}
+
+#[test]
 fn banned_clients_are_ignored() {
     let proxy = Proxy::start(&format!("{BASE_CONFIG}addip 127.0.0.1\n"), &[]);
     let client = Client::connect(proxy.addr);
